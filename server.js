@@ -4,7 +4,7 @@ const db = require('./dbconfig'); // Your MySQL pool export
 const cron = require('node-cron');
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 // ==== Middleware ====
 app.use(cors());
