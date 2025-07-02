@@ -1,10 +1,15 @@
-// server.js
 const express = require('express');
 const cors = require('cors');
-const path = require('path'); // For serving static files
-const fs = require('fs'); // For file system operations (creating directories)
-const multer = require('multer'); // For handling file uploads
-const db = require('./dbconfig'); // Ensure your dbconfig.js uses a resilient pool (mysql2)
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const mysql = require('mysql2');
+const db = require('./dbconfig.js');
+const diaryRoutes = require('./routes/diary.js')(db);
+const { registerTaskRoutes } = require('./routes/TasksAPI.js');
+const { initializeDynamicScheduler } = require('./routes/dynamicTaskScheduler');
+
+require('dotenv').config();
 
 const { format, subDays } = require('date-fns');
 const { toDate, zonedTimeToUtc } = require('date-fns-tz');
@@ -12,22 +17,29 @@ const { toDate, zonedTimeToUtc } = require('date-fns-tz');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ==== Middleware ====
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// --- Static File Serving for Attachments ---
-// Create the attachments directory if it doesn't exist
-const attachmentsDir = path.join(__dirname, 'public', 'attachments', 'tasks');
+const publicDir = path.join(__dirname, 'public');
+const attachmentsDir = path.join(publicDir, 'attachments', 'tasks');
+const studentPhotosDir = path.join(publicDir, 'uploads', 'students');
+
+if (!fs.existsSync(publicDir)) {
+  fs.mkdirSync(publicDir, { recursive: true });
+  console.log(`✅ Created public directory: ${publicDir}`);
+}
 if (!fs.existsSync(attachmentsDir)) {
   fs.mkdirSync(attachmentsDir, { recursive: true });
   console.log(`✅ Created attachments directory: ${attachmentsDir}`);
 }
-// Serve static files from the 'public' directory
-app.use('/public', express.static(path.join(__dirname, 'public')));
+if (!fs.existsSync(studentPhotosDir)) {
+  fs.mkdirSync(studentPhotosDir, { recursive: true });
+  console.log(`✅ Created student photos directory: ${studentPhotosDir}`);
+}
 
+app.use('/public', express.static(publicDir));
 
-// ==== DB Connection Test ====
 db.getConnection((err, connection) => {
   if (err) {
     console.error('❌ Database connection failed:', err.message);
@@ -35,6 +47,29 @@ db.getConnection((err, connection) => {
     console.log('✅ Connected to MySQL Database Pool');
     connection.release();
   }
+});
+
+const studentPhotoStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, studentPhotosDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const extension = path.extname(file.originalname);
+    cb(null, `student-photo-${uniqueSuffix}${extension}`);
+  }
+});
+
+const studentPhotoUpload = multer({ storage: studentPhotoStorage });
+
+app.post('/api/upload-photo', studentPhotoUpload.single('profilePhoto'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: 'No file uploaded.' });
+  }
+
+  const filePath = path.join('/public/uploads/students', req.file.filename).replace(/\\/g, '/');
+
+  res.status(200).json({ filePath: filePath });
 });
 
 
@@ -60,7 +95,7 @@ app.post('/api/login', async (req, res) => {
     let isMatch = false;
 
     if (dbPassword && dbPassword.trim() !== '') {
-      isMatch = (providedPassword === dbPassword); // In production, use bcrypt.compare
+      isMatch = (providedPassword === dbPassword); 
     } else {
       isMatch = (providedPassword === 'password');
     }
@@ -93,8 +128,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 app.get('/api/teacher/my-students', async (req, res) => {
-    // We get the teacher's managed classes from a query parameter
-    // e.g., /api/teacher/my-students?classes=9-A,Nursery-A
     const { classes } = req.query;
 
     if (!classes) {
@@ -103,8 +136,6 @@ app.get('/api/teacher/my-students', async (req, res) => {
 
     try {
         const classList = classes.split(',');
-        // This transforms ['9-A', 'Nursery-A'] into [['9', 'A'], ['Nursery', 'A']]
-        // for a robust SQL query
         const classSectionPairs = classList.map(cls => cls.split('-'));
 
         const [students] = await db.promise().query(
@@ -122,23 +153,20 @@ app.get('/api/teacher/my-students', async (req, res) => {
 app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, res) => {
   const { teacherId } = req.params;
   const decodedClassesString = decodeURIComponent(req.params.managedClasses);
-  const classes = decodedClassesString.split(','); // e.g., ['9-A', 'Nursery-A']
+  const classes = decodedClassesString.split(',');
 
   if (!teacherId || !classes || !classes.length) {
     return res.status(400).json({ message: "Teacher ID and managed classes are required." });
   }
 
-  // Create placeholders '?,?' for the IN clause
   const classPlaceholders = classes.map(() => '?').join(',');
 
   try {
-    // === Query 1: Get all student Admission Numbers for this teacher ===
     const [studentIdRows] = await db.promise().query(
       `SELECT AdmissionNo FROM Students WHERE CONCAT(CurrentClass, '-', Section) IN (${classPlaceholders})`,
       classes
     );
     
-    // If no students are found, we can stop early
     if (studentIdRows.length === 0) {
         return res.json({ totalStudents: 0, totalTasks: 0, completedTasks: 0, pendingTasks: 0, inProgressOrOverdue: 0, presentStudents: 0, absentStudents: 0, onLeaveStudents: 0 });
     }
@@ -146,7 +174,6 @@ app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, r
     const studentAdmissionNumbers = studentIdRows.map(row => row.AdmissionNo);
     const totalStudents = studentAdmissionNumbers.length;
 
-    // === Query 2: Get Task Stats ===
     const [[taskStats]] = await db.promise().query(
       `SELECT
          COUNT(Id) as totalTasks,
@@ -156,7 +183,6 @@ app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, r
       [`[[:<:]]${teacherId}[[:>:]]`]
     );
 
-    // === Query 3: Find the latest attendance date for these specific students ===
     const [[latestDateData]] = await db.promise().query(
       'SELECT MAX(AttendanceDate) as latestDate FROM Attendance WHERE StudentAdmissionNo IN (?)',
       [studentAdmissionNumbers]
@@ -165,7 +191,6 @@ app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, r
     let attendanceData = { presentStudents: 0, absentStudents: 0, onLeaveStudents: 0 };
     if (latestDateData && latestDateData.latestDate) {
       const latestDate = latestDateData.latestDate;
-      // === Query 4: Get attendance stats for that specific date and students ===
       const [[statsForDate]] = await db.promise().query(
         `SELECT
            SUM(CASE WHEN Status = 'Present' THEN 1 ELSE 0 END) as presentStudents,
@@ -178,7 +203,6 @@ app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, r
       attendanceData = statsForDate;
     }
 
-    // --- Final Calculation & Response ---
     const totalTasks = taskStats.totalTasks || 0;
     const completedTasks = taskStats.completedTasks || 0;
     const pendingTasks = taskStats.pendingTasks || 0;
@@ -206,7 +230,6 @@ app.get('/api/teacher/dashboard-stats/:teacherId/:managedClasses', async (req, r
 app.get('/api/teacher/full-details/:teacherId', async (req, res) => {
   const { teacherId } = req.params;
   try {
-    // Select all relevant fields, formatting dates for consistency
     const [rows] = await db.promise().query(
       `SELECT 
         FullName, FathersName, Qualification, 
@@ -219,12 +242,11 @@ app.get('/api/teacher/full-details/:teacherId', async (req, res) => {
     );
 
     if (rows.length > 0) {
-      // The DB stores ManagedClasses as a JSON string, so we parse it here
       const teacher = rows[0];
       try {
         teacher.ManagedClasses = JSON.parse(teacher.ManagedClasses || '[]');
       } catch (e) {
-        teacher.ManagedClasses = []; // Default to empty array if parsing fails
+        teacher.ManagedClasses = [];
       }
       res.status(200).json(teacher);
     } else {
@@ -236,10 +258,7 @@ app.get('/api/teacher/full-details/:teacherId', async (req, res) => {
   }
 });
 
-// You also need an endpoint to change the password.
-// This is a more secure example.
 app.put('/api/teacher/change-password', async (req, res) => {
-  // Now accepts an optional newUsername
   const { teacherId, currentPassword, newUsername, newPassword } = req.body;
 
   if (!teacherId || !currentPassword || !newPassword || !newUsername) {
@@ -247,7 +266,6 @@ app.put('/api/teacher/change-password', async (req, res) => {
   }
 
   try {
-      // 1. Get the teacher's current stored password to verify
       const [rows] = await db.promise().query('SELECT Password FROM Teachers WHERE Id = ?', [teacherId]);
       if (rows.length === 0) {
           return res.status(404).json({ message: "User not found." });
@@ -255,12 +273,10 @@ app.put('/api/teacher/change-password', async (req, res) => {
       
       const storedPassword = rows[0].Password;
 
-      // 2. Verify the current password matches
       if (currentPassword !== storedPassword) {
           return res.status(401).json({ message: "Incorrect current password." });
       }
 
-      // 3. Update BOTH the username and the new password
       await db.promise().query(
           'UPDATE Teachers SET Username = ?, Password = ? WHERE Id = ?', 
           [newUsername, newPassword, teacherId]
@@ -269,7 +285,6 @@ app.put('/api/teacher/change-password', async (req, res) => {
       res.status(200).json({ message: "✅ Credentials updated successfully!" });
 
   } catch (error) {
-      // Handle potential duplicate username error
       if (error.code === 'ER_DUP_ENTRY' && error.message.includes('Username')) {
           return res.status(409).json({ message: 'That username is already taken. Please choose another.' });
       }
@@ -278,9 +293,6 @@ app.put('/api/teacher/change-password', async (req, res) => {
   }
 });
 
-// =====================
-// ATTENDANCE API
-// =====================
 app.post('/api/attendance', (req, res) => {
   const attendanceRecords = req.body.records;
   const teacherName = req.body.teacherName;
@@ -376,7 +388,6 @@ app.get('/api/get-classes', (req, res) => {
 app.get('/api/student/full-details/:admissionNo', async (req, res) => {
   const { admissionNo } = req.params;
   try {
-    // Select all relevant fields, formatting dates for consistency
     const [rows] = await db.promise().query(
       `SELECT 
         FullName, AdmissionNo, FathersName, MothersName, 
@@ -419,7 +430,7 @@ app.get('/api/student/details/:admissionNo', async (req, res) => {
 
 app.get('/api/student/today-attendance/:admissionNo', async (req, res) => {
   const { admissionNo } = req.params;
-  const today = format(new Date(), 'yyyy-MM-dd'); // Get today's date
+  const today = format(new Date(), 'yyyy-MM-dd');
 
   try {
     const [rows] = await db.promise().query(
@@ -430,7 +441,6 @@ app.get('/api/student/today-attendance/:admissionNo', async (req, res) => {
     if (rows.length > 0) {
       res.status(200).json({ status: rows[0].Status });
     } else {
-      // If no record, it could mean attendance not taken yet, or they were absent by default
       res.status(200).json({ status: 'Not Marked' });
     }
   } catch (error) {
@@ -439,18 +449,15 @@ app.get('/api/student/today-attendance/:admissionNo', async (req, res) => {
   }
 });
 
-// --- Get a specific student's full attendance history ---
 app.get('/api/student/attendance/:admissionNo', async (req, res) => {
   const { admissionNo } = req.params;
   try {
     const [attendanceRows] = await db.promise().query(
-      // The DATE_FORMAT in MySQL is the most reliable way to get the correct string
       'SELECT DATE_FORMAT(AttendanceDate, "%Y-%m-%d") as AttendanceDate, Status FROM Attendance WHERE StudentAdmissionNo = ?',
       [admissionNo]
     );
 
     const attendanceMap = attendanceRows.reduce((acc, row) => {
-      // The key is now guaranteed to be the correct YYYY-MM-DD string from the DB
       acc[row.AttendanceDate] = row.Status;
       return acc;
     }, {});
@@ -465,13 +472,11 @@ app.get('/api/student/attendance/:admissionNo', async (req, res) => {
 app.get('/api/day-status/:date', async (req, res) => {
   const { date } = req.params;
   try {
-    // Check for Sunday (Day 0)
     const dayOfWeek = new Date(date).getUTCDay();
     if (dayOfWeek === 0) {
       return res.status(200).json({ isSchoolOff: true, reason: 'Weekly Off' });
     }
 
-    // Check the Holidays table
     const [rows] = await db.promise().query(
       'SELECT Description FROM Holidays WHERE HolidayDate = ?',
       [date]
@@ -487,11 +492,9 @@ app.get('/api/day-status/:date', async (req, res) => {
     res.status(500).json({ message: 'Failed to check day status.' });
   }
 });
-// --- Allow a student to update their own credentials ---
 app.put('/api/student/settings/update-credentials', async (req, res) => {
   const { admissionNo, newUsername, newPassword } = req.body;
 
-  // Basic validation
   if (!admissionNo || !newUsername || !newPassword) {
     return res.status(400).json({ message: 'Admission number, new username, and new password are required.' });
   }
@@ -509,7 +512,6 @@ app.put('/api/student/settings/update-credentials', async (req, res) => {
     res.status(200).json({ message: '✅ Credentials updated successfully!' });
 
   } catch (error) {
-    // Handle potential duplicate username error
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ message: 'That username is already taken. Please choose another.' });
     }
@@ -547,269 +549,11 @@ app.get('/api/holidays/check/:date', (req, res) => {
     else { res.status(200).json({ isHoliday: false }); }
   });
 });
-
-app.get('/api/diary', (req, res) => {
-  const sql = `SELECT * FROM DiaryEntries ORDER BY EntryDate DESC`;
-  db.query(sql, (err, results) => {
-    if (err) { console.error("❌ Error fetching diary entries:", err.message); return res.status(500).json({ message: "Failed to fetch entries", error: err.message }); }
-    const mapped = results.map(entry => ({ id: entry.Id, title: entry.Title, type: entry.Type, description: entry.Description, entryDate: entry.EntryDate, createdAt: entry.CreatedAt }));
-    res.status(200).json(mapped);
-  });
-});
-app.post('/api/diary', (req, res) => {
-  const { id, title, type, description, entryDate } = req.body;
-  if (!id || !title || !entryDate || !description) return res.status(400).json({ message: "Missing required fields" });
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(entryDate)) return res.status(400).json({ message: "Invalid entryDate format. Use YYYY-MM-DD." });
-  const sql = `INSERT INTO DiaryEntries (Id, Title, Type, Description, EntryDate) VALUES (?, ?, ?, ?, ?)`;
-  db.query(sql, [id, title, type || "Other", description, entryDate], (err, result) => {
-    if (err) return res.status(500).json({ message: "Failed to add entry", error: err.message });
-    res.status(201).json({ message: "✅ Entry added successfully", id });
-  });
-});
-app.put('/api/diary/:id', (req, res) => {
-  const { id } = req.params; const { title, type, description, entryDate } = req.body;
-  if (!title || !entryDate || !description) return res.status(400).json({ message: "Missing required fields" });
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(entryDate)) return res.status(400).json({ message: "Invalid entryDate format." });
-  const sql = `UPDATE DiaryEntries SET Title = ?, Type = ?, Description = ?, EntryDate = ? WHERE Id = ?`;
-  db.query(sql, [title, type || "Other", description, entryDate, id], (err, result) => {
-    if (err) return res.status(500).json({ message: "Update failed", error: err.message });
-    if (result.affectedRows === 0) return res.status(404).json({ message: "Entry not found" });
-    res.status(200).json({ message: "✅ Entry updated successfully" });
-  });
-});
-app.delete('/api/diary/:id', (req, res) => {
-  const { id } = req.params;
-  db.query('DELETE FROM DiaryEntries WHERE Id = ?', [id], (err, result) => {
-    if (err) return res.status(500).json({ message: 'Delete failed', error: err.message });
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'Entry not found' });
-    res.status(200).json({ message: '✅ Entry deleted successfully' });
-  });
-});
+app.use('/api/diary', diaryRoutes);
 
 
-// =====================
-// TASKS API
-// =====================
-
-// --- Multer Configuration for Task Attachments ---
-const taskAttachmentStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, attachmentsDir); // Use the globally defined attachmentsDir
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const extension = path.extname(file.originalname);
-    cb(null, 'task-' + req.params.taskId + '-' + uniqueSuffix + extension);
-  }
-});
-
-const taskAttachmentUpload = multer({
-  storage: taskAttachmentStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
-  fileFilter: function (req, file, cb) {
-    const allowedTypes = /pdf|doc|docx|jpg|jpeg|png|txt|zip/;
-    const mimetype = allowedTypes.test(file.mimetype);
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    if (mimetype && extname) {
-      return cb(null, true);
-    }
-    cb(new Error('File upload only supports the following filetypes: ' + allowedTypes));
-  }
-}).single('attachment'); // 'attachment' is the field name in FormData
-
-
-app.get('/api/tasks', (req, res) => {
-  const selectQuery = `
-    SELECT
-      Id, Title, Description, DueDate, DueTime, Priority, \`Repeat\`, Status,
-      CreatedAt, _LastGenerated, AttachmentRequired, AssignedTo, TaggedMembers,
-      AttachmentName, AttachmentPath, SubmissionText, TextSubmissionRequired
-    FROM Tasks
-    ORDER BY CreatedAt DESC, DueDate ASC, DueTime ASC 
-  `; // Added new fields
-
-  db.query(selectQuery, (err, results) => {
-    if (err) {
-      console.error('❌ Fetch error on /api/tasks:', err.message);
-      return res.status(500).json({ message: 'Failed to fetch tasks', error: err.message });
-    }
-    const mappedTasks = results.map((row) => {
-      let finalDueDateString = null;
-      if (row.DueDate) {
-        try {
-            const dateObj = new Date(row.DueDate);
-            if (!isNaN(dateObj.getTime())) {
-                finalDueDateString = format(dateObj, 'yyyy-MM-dd'); // Use date-fns for consistent formatting
-            }
-        } catch (e) { console.warn(`Could not parse date for task ${row.Id}:`, row.DueDate); }
-      }
-      return {
-        id: row.Id, title: row.Title, description: row.Description,
-        dueDate: finalDueDateString, dueTime: row.DueTime ? String(row.DueTime).slice(0, 5) : "23:59",
-        priority: row.Priority, repeat: row['Repeat'], status: row.Status || 'Pending',
-        createdAt: row.CreatedAt, _lastGenerated: row._LastGenerated,
-        attachmentRequired: !!row.AttachmentRequired,
-        assignedTo: JSON.parse(row.AssignedTo || "[]"), taggedMembers: JSON.parse(row.TaggedMembers || "[]"),
-        attachmentName: row.AttachmentName || null, // NEW
-        attachmentPath: row.AttachmentPath || null, // NEW
-        submissionText: row.SubmissionText || "",   // NEW
-        textSubmissionRequired: !!row.TextSubmissionRequired //NEW
-      };
-    });
-    res.status(200).json(mappedTasks);
-  });
-});
-
-app.post('/api/tasks', (req, res) => {
-  const t = req.body;
-  let finalDueDate = t.dueDate || null; if (finalDueDate === "") finalDueDate = null;
-  let finalDueTime = t.dueTime || '23:59:00'; if (finalDueTime.match(/^\d{2}:\d{2}$/)) finalDueTime += ':00';
-  const createdAt = t.createdAt ? new Date(t.createdAt).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ');
-  const lastGenerated = t._lastGenerated ? new Date(t._lastGenerated).toISOString().slice(0, 19).replace('T', ' ') : null;
-
-  // Include new fields for text submission and attachment requirements
-  const sql = `
-    INSERT INTO Tasks (
-      Id, Title, Description, DueDate, DueTime, Priority, \`Repeat\`, Status, CreatedAt, _LastGenerated,
-      AttachmentRequired, AssignedTo, TaggedMembers, TextSubmissionRequired 
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`; // Added TextSubmissionRequired
-  const values = [
-    t.id, t.title || "Untitled Task", t.description || "", finalDueDate, finalDueTime,
-    t.priority || 'Medium', t.repeat || 'None', t.status || 'Pending',
-    createdAt, lastGenerated, !!t.attachmentRequired,
-    JSON.stringify(t.assignedTo || []), JSON.stringify(t.taggedMembers || []),
-    !!t.textSubmissionRequired // NEW
-  ];
-
-  db.query(sql, values, (err, result) => {
-    if (err) { console.error('❌ Insert error on /api/tasks:', err.message, "Values:", values); return res.status(500).json({ message: 'Failed to add task', error: err.message }); }
-    const createdTask = {
-      id: t.id, title: values[1], description: values[2], dueDate: finalDueDate, dueTime: finalDueTime.slice(0,5),
-      priority: values[5], repeat: values[6], status: values[7], createdAt: values[8], _lastGenerated: values[9],
-      attachmentRequired: values[10], assignedTo: t.assignedTo || [], taggedMembers: t.taggedMembers || [],
-      textSubmissionRequired: !!t.textSubmissionRequired // NEW
-    };
-    res.status(201).json({ message: '✅ Task added successfully', task: createdTask });
-  });
-});
-
-app.put('/api/tasks/:id', (req, res) => {
-  const { id } = req.params; const t = req.body;
-  const sqlSetParts = []; const sqlValues = [];
-  const fieldMap = {
-      title: 'Title', description: 'Description', dueDate: 'DueDate', dueTime: 'DueTime',
-      priority: 'Priority', repeat: '`Repeat`', status: 'Status', _lastGenerated: '_LastGenerated',
-      attachmentRequired: 'AttachmentRequired', assignedTo: 'AssignedTo', taggedMembers: 'TaggedMembers',
-      attachmentName: 'AttachmentName', attachmentPath: 'AttachmentPath', // For direct updates if needed, though usually set by upload
-      submissionText: 'SubmissionText', textSubmissionRequired: 'TextSubmissionRequired' // NEW
-  };
-  for (const key in t) {
-      if (t.hasOwnProperty(key) && fieldMap[key]) {
-          const dbColumn = fieldMap[key]; let value = t[key];
-          if (key === 'dueDate' && (value === '' || value === '0000-00-00')) value = null;
-          if (key === 'dueTime' && value && value.match(/^\d{2}:\d{2}$/)) value += ':00';
-          if (key === 'assignedTo' || key === 'taggedMembers') value = JSON.stringify(value || []);
-          if (key === 'attachmentRequired' || key === 'textSubmissionRequired') value = !!value;
-          if (key === '_lastGenerated' && value) value = new Date(value).toISOString().slice(0, 19).replace('T', ' ');
-          sqlSetParts.push(`${dbColumn} = ?`); sqlValues.push(value);
-      }
-  }
-  if (sqlSetParts.length === 0) { return res.status(200).json({ message: 'No valid fields provided for update.' }); }
-  sqlValues.push(id); const sql = `UPDATE Tasks SET ${sqlSetParts.join(', ')} WHERE Id = ?`;
-  db.query(sql, sqlValues, (err, result) => {
-    if (err) { console.error(`❌ SQL Update error on /api/tasks/${id}:`, err.message); return res.status(500).json({ message: 'Failed to update task in database', error: err.message }); }
-    if (result.affectedRows === 0) { return res.status(404).json({ message: 'Task not found' }); }
-    res.status(200).json({ message: 'Task updated successfully' });
-  });
-});
-
-app.delete('/api/tasks/:id', (req, res) => {
-  const { id } = req.params;
-  // Potentially delete associated attachment file from server here
-  db.query('SELECT AttachmentPath FROM Tasks WHERE Id = ?', [id], (err, rows) => {
-    if (err) { console.error('Error fetching task for deletion:', err); /* Continue to delete DB record */ }
-    if (rows && rows.length > 0 && rows[0].AttachmentPath) {
-        const filePath = path.join(__dirname, rows[0].AttachmentPath); // Assuming AttachmentPath is relative from server root
-        fs.unlink(filePath, (unlinkErr) => {
-            if (unlinkErr) console.warn(`Could not delete attachment file ${filePath}:`, unlinkErr);
-            else console.log(`Deleted attachment file ${filePath}`);
-        });
-    }
-    db.query('DELETE FROM Tasks WHERE Id = ?', [id], (deleteErr, result) => {
-        if (deleteErr) { console.error(`❌ Delete error on /api/tasks/${id}:`, deleteErr.message); return res.status(500).json({ message: 'Failed to delete task', error: deleteErr.message }); }
-        if (result.affectedRows === 0) return res.status(404).json({ message: 'Task not found' });
-        res.status(200).json({ message: '🗑️ Task deleted successfully' });
-    });
-  });
-});
-
-// --- NEW: Endpoint for Task Attachment Upload ---
-app.post('/api/tasks/:taskId/upload-attachment', (req, res) => {
-  taskAttachmentUpload(req, res, function (err) {
-    const taskId = req.params.taskId;
-    if (err instanceof multer.MulterError) {
-      console.error(`Multer error uploading for task ${taskId}:`, err);
-      return res.status(400).json({ message: `File upload error: ${err.message}` });
-    } else if (err) {
-      console.error(`Unknown error uploading for task ${taskId}:`, err);
-      return res.status(500).json({ message: `File upload failed: ${err.message}` });
-    }
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file was uploaded or file type is not allowed.' });
-    }
-
-    const fileName = req.file.filename;
-    // Store path relative to the 'public' folder for client access
-    const filePath = `/public/attachments/tasks/${fileName}`;
-
-    // Update the task record in the database with attachment info
-    const sql = "UPDATE Tasks SET AttachmentName = ?, AttachmentPath = ? WHERE Id = ?";
-    db.query(sql, [req.file.originalname, filePath, taskId], (dbErr, result) => {
-      if (dbErr) {
-        console.error(`DB error updating task ${taskId} with attachment:`, dbErr);
-        // Attempt to delete the uploaded file if DB update fails
-        fs.unlink(req.file.path, (unlinkErr) => {
-          if (unlinkErr) console.error("Error deleting orphaned attachment file:", unlinkErr);
-        });
-        return res.status(500).json({ message: 'Failed to save attachment details to database.' });
-      }
-      if (result.affectedRows === 0) {
-        fs.unlink(req.file.path, (unlinkErr) => {
-          if (unlinkErr) console.error("Error deleting orphaned attachment file for non-existent task:", unlinkErr);
-        });
-        return res.status(404).json({ message: 'Task not found to associate attachment with.' });
-      }
-      res.status(200).json({
-        message: 'Attachment uploaded and linked successfully!',
-        fileName: req.file.originalname, // Send original name for display
-        filePath: filePath // Send server-relative path for client to construct URL
-      });
-    });
-  });
-});
-
-// --- NEW: Endpoint for Task Text Submission ---
-app.post('/api/tasks/:taskId/submit-text', (req, res) => {
-  const { taskId } = req.params;
-  const { submissionText } = req.body;
-
-  if (submissionText === undefined || submissionText === null) {
-    return res.status(400).json({ message: 'Submission text is required.' });
-  }
-  // Optional: Add validation for submissionText length, etc.
-
-  const sql = "UPDATE Tasks SET SubmissionText = ? WHERE Id = ?";
-  db.query(sql, [submissionText, taskId], (err, result) => {
-    if (err) {
-      console.error(`DB error updating task ${taskId} with text submission:`, err);
-      return res.status(500).json({ message: 'Failed to save text submission.' });
-    }
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: 'Task not found.' });
-    }
-    res.status(200).json({ message: 'Text submission saved successfully!' });
-  });
-});
+registerTaskRoutes(app, db);
+initializeDynamicScheduler(db);
 
 
 const formatDateForDB = (dateStr) => {
@@ -817,9 +561,9 @@ const formatDateForDB = (dateStr) => {
   try {
     const date = new Date(dateStr);
     if (isNaN(date.getTime())) {
-      if (typeof dateStr === 'number' && dateStr > 25568 && dateStr < 50000) { // Excel date number check
+      if (typeof dateStr === 'number' && dateStr > 25568 && dateStr < 50000) {
         const excelEpoch = new Date(1899, 11, 30);
-        const correctDate = new Date(excelEpoch.getTime() + (dateStr -1) * 24 * 60 * 60 * 1000);
+        const correctDate = new Date(excelEpoch.getTime() + (dateStr - 1) * 24 * 60 * 60 * 1000);
         if(!isNaN(correctDate.getTime())) return correctDate.toISOString().split('T')[0];
       }
       return null;
@@ -828,131 +572,130 @@ const formatDateForDB = (dateStr) => {
   } catch (e) { return null; }
 };
 
-// ===== STUDENTS API =====
-app.post('/api/student-login', async (req, res) => {
-  const { username: providedUsername, password: providedPassword } = req.body;
-
-  if (!providedUsername || !providedPassword) {
-    return res.status(400).json({ message: 'Username and password are required.' });
-  }
-
-  try {
-    const [rows] = await db.promise().query(
-      `SELECT AdmissionNo, FullName, Username, Password, Phone, DATE_FORMAT(DOB, '%d/%m/%Y') as FormattedDOB 
-       FROM Students 
-       WHERE Username = ? OR Phone = ?`,
-      [providedUsername, providedUsername]
-    );
-
-    if (rows.length === 0) {
-      return res.status(401).json({ message: 'Invalid credentials.' });
-    }
-
-    let matchedStudent = null;
-    for (const student of rows) {
-      if (student.Username === providedUsername && student.Password === providedPassword) {
-        matchedStudent = student;
-        break;
-      }
-      if (student.Phone === providedUsername && student.FormattedDOB === providedPassword) {
-        matchedStudent = student;
-        break;
-      }
-    }
-
-    if (matchedStudent) {
-      res.status(200).json({
-        id: matchedStudent.AdmissionNo,
-        name: matchedStudent.FullName,
-        username: matchedStudent.Username || matchedStudent.Phone,
-        role: 'student',
-        managedClasses: []
-      });
-    } else {
-      res.status(401).json({ message: 'Invalid credentials.' });
-    }
-  } catch (error) {
-    console.error('❌ Student Login API Error:', error);
-    res.status(500).json({ message: 'An error occurred during student login.' });
-  }
-});
-// --- Add a New Student ---
 app.post('/api/add-student', (req, res) => {
   const s = req.body;
 
-  // --- Logic for default credentials (this part is already correct) ---
   const finalUsername = (s.username && s.username.trim() !== '') ? s.username.trim() : s.phone;
   let finalPassword = (s.password && s.password.trim() !== '') ? s.password.trim() : null;
   if (!finalPassword && s.dob) {
-    try {
-      finalPassword = format(new Date(s.dob), 'dd/MM/yyyy');
-    } catch (e) {
-      console.error("Could not format DOB for default password:", e);
-      finalPassword = null;
-    }
+    try { finalPassword = format(new Date(s.dob), 'dd/MM/yyyy'); }
+    catch (e) { finalPassword = null; }
   }
 
-  const sql = `INSERT INTO Students (SrNo, AdmissionDate, AdmissionNo, FullName, FathersName, MothersName, DOB, Address, Phone, Whatsapp, ClassAdmitted, CurrentClass, Section, Username, Password) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-  const values = [s.srNo, formatDateForDB(s.admissionDate), s.admissionNo, s.fullName, s.fathersName, s.mothersName, formatDateForDB(s.dob), s.address, s.phone, s.whatsapp || s.phone, s.classAdmitted, s.currentClass, s.section, finalUsername, finalPassword];
+  const sql = `INSERT INTO Students (SrNo, AdmissionDate, AdmissionNo, FullName, FathersName, MothersName, DOB, Address, Phone, Whatsapp, ClassAdmitted, CurrentClass, Section, Username, Password, ProfilePhotoUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const values = [s.srNo, formatDateForDB(s.admissionDate), s.admissionNo, s.fullName, s.fathersName, s.mothersName, formatDateForDB(s.dob), s.address, s.phone, s.whatsapp || s.phone, s.classAdmitted, s.currentClass, s.section, finalUsername, finalPassword, s.profilePhotoUrl || null];
   
   db.query(sql, values, (err, result) => {
     if (err) {
       console.error("Error adding student:", err.message);
+      if (err.code === 'ER_DUP_ENTRY' && err.message.includes('AdmissionNo')) {
+        return res.status(409).json({ message: 'Admission Number already exists. Please use a unique number.' });
+      }
+      if (err.code === 'ER_DUP_ENTRY' && err.message.includes('Username')) {
+        return res.status(409).json({ message: 'The chosen username is already taken. Please choose a different one.' });
+      }
       return res.status(500).json({ message: 'Add student failed', error: err.message });
     }
 
-    // --- THIS IS THE KEY CHANGE ---
-    // Create the full student object to send back to the frontend.
     const newStudent = {
       ...s,
       SrNo: s.srNo,
       AdmissionDate: formatDateForDB(s.admissionDate),
       DOB: formatDateForDB(s.dob),
-      Username: finalUsername, // Send back the generated or provided username
-      Password: finalPassword, // Send back the generated or provided password
+      Username: finalUsername,
+      Password: finalPassword,
+      ProfilePhotoUrl: s.profilePhotoUrl || null,
     };
 
-    // Respond with a success message AND the complete student object.
     res.status(201).json({ message: '✅ Student added', student: newStudent });
   });
 });
-// --- Get All Students ---
+
 app.get('/api/get-students', (req, res) => {
-  db.query('SELECT *, DATE_FORMAT(AdmissionDate, "%Y-%m-%d") as AdmissionDate, DATE_FORMAT(DOB, "%Y-%m-%d") as DOB FROM Students ORDER BY SrNo ASC', (err, results) => {
+  const sql = `SELECT *, ProfilePhotoUrl, DATE_FORMAT(AdmissionDate, "%Y-%m-%d") as AdmissionDate, DATE_FORMAT(DOB, "%Y-%m-%d") as DOB FROM Students ORDER BY SrNo ASC`;
+  db.query(sql, (err, results) => {
     if (err) return res.status(500).json({ message: 'Student fetch failed', error: err.message });
     res.status(200).json(results);
   });
 });
-// --- Update a Student ---
-app.put('/api/update-student', (req, res) => {
-  const s = req.body;
-  if (!s.admissionNo) {
-    return res.status(400).json({ message: 'AdmissionNo is required.' });
+
+app.put('/api/update-student', async (req, res) => {
+  const { admissionNo } = req.body;
+
+  if (!admissionNo) {
+    return res.status(400).json({ message: "Admission number is required for update." });
   }
-  
-  const sql = `UPDATE Students SET 
-    SrNo = ?, AdmissionDate = ?, FullName = ?, FathersName = ?, MothersName = ?, 
-    DOB = ?, Address = ?, Phone = ?, Whatsapp = ?, ClassAdmitted = ?, CurrentClass = ?, Section = ?, 
-    Username = ?, Password = ? 
-    WHERE AdmissionNo = ?`;
-    
-  const values = [
-    s.srNo, formatDateForDB(s.admissionDate), s.fullName, s.fathersName, s.mothersName, 
-    formatDateForDB(s.dob), s.address, s.phone, s.whatsapp || s.phone, s.classAdmitted, s.currentClass, s.section,
-    s.username, s.password, // The new fields
-    s.admissionNo
-  ];
-  
-  db.query(sql, values, (err, result) => {
-    if (err) {
-      console.error("Error updating student:", err.message);
-      return res.status(500).json({ message: 'Student update failed', error: err.message });
+
+  try {
+    // Step 1: Fetch the student's current data from the database. This is our trusted source.
+    const [existingStudents] = await db.promise().query(
+      'SELECT * FROM Students WHERE AdmissionNo = ?',
+      [admissionNo]
+    );
+
+    if (existingStudents.length === 0) {
+      return res.status(404).json({ message: "Student not found." });
     }
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'Student not found.' });
-    res.status(200).json({ message: '✅ Student updated successfully' });
-  });
+
+    const currentData = existingStudents[0];
+
+    // Step 2: Prepare a new object for the update.
+    // We start with the current data, ensuring no fields are accidentally erased.
+    // The keys here should match your database column names (PascalCase).
+    let dataToUpdate = {
+      FullName: currentData.FullName,
+      FathersName: currentData.FathersName,
+      MothersName: currentData.MothersName,
+      DOB: currentData.DOB,
+      Phone: currentData.Phone,
+      Whatsapp: currentData.Whatsapp,
+      Address: currentData.Address,
+      CurrentClass: currentData.CurrentClass,
+      Section: currentData.Section,
+      ProfilePhotoUrl: currentData.ProfilePhotoUrl // Start with the existing photo URL
+    };
+
+    // Step 3: Explicitly merge changes from the request body.
+    // This is the most important part.
+    // We check for the camelCase key from the frontend (`req.body.profilePhotoUrl`)
+    // and assign its value to our PascalCase database key (`dataToUpdate.ProfilePhotoUrl`).
+    
+    if (req.body.profilePhotoUrl !== undefined) {
+      dataToUpdate.ProfilePhotoUrl = req.body.profilePhotoUrl;
+    }
+    
+    // (Optional but good practice) You can do the same for other fields if they are editable
+    // if (req.body.FullName) dataToUpdate.FullName = req.body.FullName;
+    // if (req.body.Phone) dataToUpdate.Phone = req.body.Phone;
+
+
+    // Step 4: Execute the update with the complete, safe data.
+    const sql = `
+      UPDATE Students SET
+        FullName = ?, FathersName = ?, MothersName = ?, DOB = ?,
+        Phone = ?, Whatsapp = ?, Address = ?, CurrentClass = ?, Section = ?,
+        ProfilePhotoUrl = ?
+      WHERE AdmissionNo = ?`;
+
+    const values = [
+      dataToUpdate.FullName, dataToUpdate.FathersName, dataToUpdate.MothersName, new Date(dataToUpdate.DOB),
+      dataToUpdate.Phone, dataToUpdate.Whatsapp, dataToUpdate.Address, dataToUpdate.CurrentClass, dataToUpdate.Section,
+      dataToUpdate.ProfilePhotoUrl, // This now contains the correct new value
+      admissionNo
+    ];
+
+    await db.promise().query(sql, values);
+
+    res.status(200).json({ message: "Student updated successfully." });
+
+  } catch (error) {
+    console.error("Error updating student:", error);
+    res.status(500).json({ message: "Failed to update student data." });
+  }
 });
-// --- Delete a Student ---
+
+
+
 app.delete('/api/delete-student/:admissionNo', (req, res) => {
   const { admissionNo } = req.params;
   db.query('DELETE FROM Students WHERE AdmissionNo = ?', [admissionNo], (err, result) => {
@@ -962,7 +705,6 @@ app.delete('/api/delete-student/:admissionNo', (req, res) => {
   });
 });
 
-// ===== TEACHERS API =====
 app.post('/api/import-teachers', async (req, res) => {
   const { teachers } = req.body;
   if (!Array.isArray(teachers) || teachers.length === 0) return res.status(400).json({ message: 'No teacher data provided or invalid format.' });
@@ -1043,9 +785,6 @@ app.delete('/api/delete-teacher/:id', (req, res) => {
   });
 });
 
-// ==== 404 Catch All ====
 app.use((req, res) => { res.status(404).json({ message: `❌ Route not found: ${req.method} ${req.originalUrl}`}); });
-// ==== Global Error Handler ====
 app.use((err, req, res, next) => { console.error("💥 GLOBAL ERROR HANDLER:", err.stack); res.status(500).json({ message: "❌ An unexpected server error occurred." }); });
-// ==== Start Server ====
 app.listen(PORT, () => { console.log(`🚀 Server running on http://localhost:${PORT}`); });
