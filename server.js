@@ -72,6 +72,49 @@ app.post('/api/upload-photo', studentPhotoUpload.single('profilePhoto'), (req, r
   res.status(200).json({ filePath: filePath });
 });
 
+app.post('/api/student-login', async (req, res) => {
+  const { username, password: providedPassword } = req.body;
+
+  if (!username || !providedPassword) {
+    return res.status(400).json({ message: 'Username and password are required.' });
+  }
+
+  try {
+    // Query the Students table for a matching username
+    const [rows] = await db.promise().query(
+      'SELECT AdmissionNo, FullName, Username, Password FROM Students WHERE Username = ?',
+      [username]
+    );
+
+    // If no student with that username is found, return an error
+    if (rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid username or password.' });
+    }
+
+    const student = rows[0];
+    const dbPassword = student.Password;
+
+    // Compare the provided password with the one from the database
+    if (providedPassword === dbPassword) {
+      // If passwords match, create the user data object for the frontend
+      const userData = {
+        id: student.AdmissionNo, // Use AdmissionNo as the unique ID for students
+        name: student.FullName,
+        username: student.Username,
+        role: 'student', // Hardcode the role as 'student'
+        managedClasses: [], // Students do not manage classes
+      };
+      // Send a success response with the user data
+      res.status(200).json(userData);
+    } else {
+      // If passwords do not match, return an error
+      res.status(401).json({ message: 'Invalid username or password.' });
+    }
+  } catch (error) {
+    console.error('❌ Student Login API Error:', error);
+    res.status(500).json({ message: 'An error occurred during the login process.' });
+  }
+});
 
 app.post('/api/login', async (req, res) => {
   const { username, password: providedPassword } = req.body;
@@ -345,6 +388,8 @@ app.get('/api/students-by-class/:classSection', (req, res) => {
     res.status(200).json(results);
   });
 });
+
+
 app.get('/api/attendance-report', (req, res) => {
   const sql = `
     SELECT a.Id, a.AttendanceDate, a.Status, a.MarkedByTeacher, s.AdmissionNo, s.FullName, s.CurrentClass, s.Section
