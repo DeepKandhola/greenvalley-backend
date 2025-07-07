@@ -31,5 +31,8 @@
         "url": "https://github.com/deepkandhola/greenvalley-backend/issues"
     },
     "homepage": "https://github.com/deepkandhola/greenvalley-backend#readme",
-    "description": ""
+    "description": "",
+    "devDependencies": {
+        "nodemon": "^3.1.10"
+    }
 }

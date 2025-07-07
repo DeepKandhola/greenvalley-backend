@@ -4,22 +4,33 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const mysql = require('mysql2');
-const db = require('./dbconfig.js');
-const diaryRoutes = require('./routes/diary.js')(db);
-const { registerTaskRoutes } = require('./routes/TasksAPI.js');
-const { initializeDynamicScheduler } = require('./routes/dynamicTaskScheduler');
-
 require('dotenv').config();
+
 
 const { format, subDays } = require('date-fns');
 const { toDate, zonedTimeToUtc } = require('date-fns-tz');
 
+// 1. Create the Express App FIRST
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// 2. Import local modules & routers
+const db = require('./dbconfig.js');
+const diaryRoutes = require('./routes/diary.js')(db);
+const { registerTaskRoutes } = require('./routes/TasksAPI.js');
+const { initializeDynamicScheduler } = require('./routes/dynamicTaskScheduler');
+const dashboardRoutes = require('./routes/DashboardAPI.js')(db);
+const teacherRoutes = require('./routes/TeachersAPI.js')(db);
+
+// 3. Use Middleware & Mount Routers
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Mount all your API routers together for clarity
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/diary', diaryRoutes);
+app.use('/api', teacherRoutes);
 
 const publicDir = path.join(__dirname, 'public');
 const attachmentsDir = path.join(publicDir, 'attachments', 'tasks');
@@ -49,18 +60,56 @@ db.getConnection((err, connection) => {
   }
 });
 
+app.get('/api/get-activity-logs', async (req, res) => {
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 10;
+  const offset = (page - 1) * limit;
+
+  try {
+      // Query to get the total number of logs for pagination
+      const [[{ totalItems }]] = await db.promise().query('SELECT COUNT(*) as totalItems FROM ActivityLogs');
+      
+      // Query to get the logs for the current page
+      const [logs] = await db.promise().query('SELECT * FROM ActivityLogs ORDER BY Timestamp DESC LIMIT ? OFFSET ?', [limit, offset]);
+      
+      res.status(200).json({
+          logs,
+          totalPages: Math.ceil(totalItems / limit),
+          currentPage: page
+      });
+  } catch (error) {
+      console.error('❌ Error fetching activity logs:', error.message);
+      res.status(500).json({ message: 'Failed to fetch activity logs', error: error.message });
+  }
+});
+
+
+const logStudentActivity = async (actionType, performedBy, targetAdmissionNo, targetName, details = '') => {
+  const sql = `
+    INSERT INTO StudentActivityLogs (ActionType, PerformedBy, TargetAdmissionNo, TargetName, Details) 
+    VALUES (?, ?, ?, ?, ?)`;
+  try {
+    await db.promise().query(sql, [actionType, performedBy, targetAdmissionNo, targetName, details]);
+  } catch (error) {
+    console.error('❌ Failed to log student activity:', error.message);
+  }
+};
+
 const studentPhotoStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, studentPhotosDir);
-  },
+  destination: (req, file, cb) => cb(null, studentPhotosDir),
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const extension = path.extname(file.originalname);
-    cb(null, `student-photo-${uniqueSuffix}${extension}`);
+    cb(null, `student-photo-${uniqueSuffix}${path.extname(file.originalname)}`);
   }
 });
 
 const studentPhotoUpload = multer({ storage: studentPhotoStorage });
+app.post('/api/upload-photo', studentPhotoUpload.single('profilePhoto'), (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+  const filePath = path.join('/public/uploads/students', req.file.filename).replace(/\\/g, '/');
+  res.status(200).json({ filePath: filePath });
+});
+
 
 app.post('/api/upload-photo', studentPhotoUpload.single('profilePhoto'), (req, res) => {
   if (!req.file) {
@@ -594,7 +643,6 @@ app.get('/api/holidays/check/:date', (req, res) => {
     else { res.status(200).json({ isHoliday: false }); }
   });
 });
-app.use('/api/diary', diaryRoutes);
 
 
 registerTaskRoutes(app, db);
@@ -617,43 +665,26 @@ const formatDateForDB = (dateStr) => {
   } catch (e) { return null; }
 };
 
-app.post('/api/add-student', (req, res) => {
+app.post('/api/add-student', async (req, res) => {
   const s = req.body;
+  const sql = `INSERT INTO Students (SrNo, AdmissionDate, AdmissionNo, FullName, FathersName, MothersName, DOB, Address, Phone, Whatsapp, ClassAdmitted, CurrentClass, Section, Username, Password, ProfilePhotoUrl, IsActive) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const values = [
+    s.srNo, formatDateForDB(s.admissionDate), s.admissionNo, s.fullName, s.fathersName,
+    s.mothersName, formatDateForDB(s.dob), s.address, s.phone, s.whatsapp || s.phone,
+    s.classAdmitted, s.currentClass, s.section, s.username || s.phone, s.password || null, s.profilePhotoUrl || null,
+    (s.isActive === 'true' || s.isActive === true) ? 1 : 0
+  ];
 
-  const finalUsername = (s.username && s.username.trim() !== '') ? s.username.trim() : s.phone;
-  let finalPassword = (s.password && s.password.trim() !== '') ? s.password.trim() : null;
-  if (!finalPassword && s.dob) {
-    try { finalPassword = format(new Date(s.dob), 'dd/MM/yyyy'); }
-    catch (e) { finalPassword = null; }
-  }
-
-  const sql = `INSERT INTO Students (SrNo, AdmissionDate, AdmissionNo, FullName, FathersName, MothersName, DOB, Address, Phone, Whatsapp, ClassAdmitted, CurrentClass, Section, Username, Password, ProfilePhotoUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-  const values = [s.srNo, formatDateForDB(s.admissionDate), s.admissionNo, s.fullName, s.fathersName, s.mothersName, formatDateForDB(s.dob), s.address, s.phone, s.whatsapp || s.phone, s.classAdmitted, s.currentClass, s.section, finalUsername, finalPassword, s.profilePhotoUrl || null];
-  
-  db.query(sql, values, (err, result) => {
-    if (err) {
-      console.error("Error adding student:", err.message);
-      if (err.code === 'ER_DUP_ENTRY' && err.message.includes('AdmissionNo')) {
-        return res.status(409).json({ message: 'Admission Number already exists. Please use a unique number.' });
-      }
-      if (err.code === 'ER_DUP_ENTRY' && err.message.includes('Username')) {
-        return res.status(409).json({ message: 'The chosen username is already taken. Please choose a different one.' });
-      }
-      return res.status(500).json({ message: 'Add student failed', error: err.message });
-    }
-
-    const newStudent = {
-      ...s,
-      SrNo: s.srNo,
-      AdmissionDate: formatDateForDB(s.admissionDate),
-      DOB: formatDateForDB(s.dob),
-      Username: finalUsername,
-      Password: finalPassword,
-      ProfilePhotoUrl: s.profilePhotoUrl || null,
-    };
-
+  try {
+    const [result] = await db.promise().query(sql, values);
+    const newStudent = { ...s, id: result.insertId };
+    await logStudentActivity('CREATE', 'Admin', s.admissionNo, s.fullName, 'New student record created.');
     res.status(201).json({ message: '✅ Student added', student: newStudent });
-  });
+  } catch (err) {
+    console.error("Error adding student:", err.message);
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'Admission Number or Username already exists.' });
+    return res.status(500).json({ message: 'Add student failed', error: err.message });
+  }
 });
 
 app.get('/api/get-students', (req, res) => {
@@ -665,81 +696,134 @@ app.get('/api/get-students', (req, res) => {
 });
 
 app.put('/api/update-student', async (req, res) => {
-  const { admissionNo } = req.body;
+    const { admissionNo, ...updatedFields } = req.body;
+    if (!admissionNo) return res.status(400).json({ message: "Admission number is required for update." });
+  
+    try {
+      const [[oldStudent]] = await db.promise().query('SELECT * FROM Students WHERE AdmissionNo = ?', [admissionNo]);
+      if (!oldStudent) return res.status(404).json({ message: "Student not found." });
+  
+      const changes = [];
+      const setClauses = [];
+      const queryValues = [];
+      
+      const compareAndUpdate = (fieldName, dbColumn, label, isDate = false) => {
+        if (updatedFields[fieldName] !== undefined) {
+          let newValue = isDate ? formatDateForDB(updatedFields[fieldName]) : updatedFields[fieldName];
+          let oldValue = isDate ? formatDateForDB(oldStudent[dbColumn]) : oldStudent[dbColumn];
+          if (String(newValue) !== String(oldValue)) {
+            changes.push(`${label} updated`);
+            setClauses.push(`${dbColumn} = ?`);
+            queryValues.push(newValue);
+          }
+        }
+      };
 
-  if (!admissionNo) {
-    return res.status(400).json({ message: "Admission number is required for update." });
-  }
-
-  try {
-    // Step 1: Fetch the student's current data from the database. This is our trusted source.
-    const [existingStudents] = await db.promise().query(
-      'SELECT * FROM Students WHERE AdmissionNo = ?',
-      [admissionNo]
-    );
-
-    if (existingStudents.length === 0) {
-      return res.status(404).json({ message: "Student not found." });
+      compareAndUpdate('srNo', 'SrNo', 'Sr. No.');
+      compareAndUpdate('admissionDate', 'AdmissionDate', 'Admission Date', true);
+      compareAndUpdate('fullName', 'FullName', 'Full Name');
+      compareAndUpdate('fathersName', 'FathersName', "Father's Name");
+      compareAndUpdate('mothersName', 'MothersName', "Mother's Name");
+      compareAndUpdate('dob', 'DOB', 'Date of Birth', true);
+      compareAndUpdate('address', 'Address', 'Address');
+      compareAndUpdate('phone', 'Phone', 'Phone');
+      compareAndUpdate('whatsapp', 'Whatsapp', 'WhatsApp');
+      compareAndUpdate('classAdmitted', 'ClassAdmitted', 'Class Admitted');
+      compareAndUpdate('currentClass', 'CurrentClass', 'Current Class');
+      compareAndUpdate('section', 'Section', 'Section');
+      compareAndUpdate('username', 'Username', 'Username');
+      compareAndUpdate('profilePhotoUrl', 'ProfilePhotoUrl', 'Profile Photo');
+      
+      if (updatedFields.password && updatedFields.password.trim() !== '') {
+        changes.push('Password updated');
+        setClauses.push('Password = ?');
+        queryValues.push(updatedFields.password);
+      }
+      
+      const newIsActive = (updatedFields.isActive === 'true' || updatedFields.isActive === true) ? 1 : 0;
+      if (newIsActive !== oldStudent.IsActive) {
+        changes.push(`Status changed to ${newIsActive ? 'Active' : 'Inactive'}`);
+        setClauses.push('IsActive = ?');
+        queryValues.push(newIsActive);
+        if (newIsActive === 0 && !oldStudent.DateOfInactive) {
+            setClauses.push('DateOfInactive = CURDATE()');
+        } else if (newIsActive === 1) {
+            setClauses.push('DateOfInactive = NULL');
+        }
+      }
+  
+      if (setClauses.length === 0) return res.status(200).json({ message: "No changes were made.", student: oldStudent });
+  
+      queryValues.push(admissionNo);
+      const sql = `UPDATE Students SET ${setClauses.join(', ')} WHERE AdmissionNo = ?`;
+      await db.promise().query(sql, queryValues);
+  
+      const [updatedStudentRows] = await db.promise().query(`SELECT * FROM Students WHERE AdmissionNo = ?`, [admissionNo]);
+      await logStudentActivity('UPDATE', 'Admin', admissionNo, updatedFields.fullName || oldStudent.FullName, changes.join('; '));
+  
+      res.status(200).json({ message: "✅ Student updated successfully!", student: updatedStudentRows[0] });
+  
+    } catch (error) {
+      console.error("Error updating student:", error);
+      if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'Username is already taken.' });
+      res.status(500).json({ message: "Failed to update student data." });
     }
-
-    const currentData = existingStudents[0];
-
-    // Step 2: Prepare a new object for the update.
-    // We start with the current data, ensuring no fields are accidentally erased.
-    // The keys here should match your database column names (PascalCase).
-    let dataToUpdate = {
-      FullName: currentData.FullName,
-      FathersName: currentData.FathersName,
-      MothersName: currentData.MothersName,
-      DOB: currentData.DOB,
-      Phone: currentData.Phone,
-      Whatsapp: currentData.Whatsapp,
-      Address: currentData.Address,
-      CurrentClass: currentData.CurrentClass,
-      Section: currentData.Section,
-      ProfilePhotoUrl: currentData.ProfilePhotoUrl // Start with the existing photo URL
-    };
-
-    // Step 3: Explicitly merge changes from the request body.
-    // This is the most important part.
-    // We check for the camelCase key from the frontend (`req.body.profilePhotoUrl`)
-    // and assign its value to our PascalCase database key (`dataToUpdate.ProfilePhotoUrl`).
-    
-    if (req.body.profilePhotoUrl !== undefined) {
-      dataToUpdate.ProfilePhotoUrl = req.body.profilePhotoUrl;
-    }
-    
-    // (Optional but good practice) You can do the same for other fields if they are editable
-    // if (req.body.FullName) dataToUpdate.FullName = req.body.FullName;
-    // if (req.body.Phone) dataToUpdate.Phone = req.body.Phone;
-
-
-    // Step 4: Execute the update with the complete, safe data.
-    const sql = `
-      UPDATE Students SET
-        FullName = ?, FathersName = ?, MothersName = ?, DOB = ?,
-        Phone = ?, Whatsapp = ?, Address = ?, CurrentClass = ?, Section = ?,
-        ProfilePhotoUrl = ?
-      WHERE AdmissionNo = ?`;
-
-    const values = [
-      dataToUpdate.FullName, dataToUpdate.FathersName, dataToUpdate.MothersName, new Date(dataToUpdate.DOB),
-      dataToUpdate.Phone, dataToUpdate.Whatsapp, dataToUpdate.Address, dataToUpdate.CurrentClass, dataToUpdate.Section,
-      dataToUpdate.ProfilePhotoUrl, // This now contains the correct new value
-      admissionNo
-    ];
-
-    await db.promise().query(sql, values);
-
-    res.status(200).json({ message: "Student updated successfully." });
-
-  } catch (error) {
-    console.error("Error updating student:", error);
-    res.status(500).json({ message: "Failed to update student data." });
-  }
 });
 
+app.post('/api/students/batch-import', async (req, res) => {
+    const studentsToImport = req.body;
+    if (!Array.isArray(studentsToImport) || studentsToImport.length === 0) {
+        return res.status(400).json({ message: 'No student data provided.' });
+    }
 
+    let successCount = 0;
+    const errors = [];
+    
+    for (const s of studentsToImport) {
+        const sql = `INSERT INTO Students (SrNo, AdmissionDate, AdmissionNo, FullName, FathersName, MothersName, DOB, Address, Phone, Whatsapp, ClassAdmitted, CurrentClass, Section, Username, Password, IsActive) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        const values = [
+            s['SrNo'] || null, formatDateForDB(s['AdmissionDate']), s['AdmissionNo'], s['FullName'],
+            s['FathersName'] || null, s['MothersName'] || null, formatDateForDB(s['DOB']),
+            s['Address'] || null, s['Phone'] || null, s['Whatsapp'] || s['Phone'] || null,
+            s['ClassAdmitted'] || null, s['CurrentClass'] || null, s['Section'] || null,
+            s['Username'] || s['Phone'] || s['AdmissionNo'], s['Password'] || null,
+            (s['IsActive'] === 0 || String(s['IsActive']).toLowerCase() === 'false') ? 0 : 1,
+        ];
+
+        try {
+            await db.promise().query(sql, values);
+            await logStudentActivity('CREATE', 'Admin (Batch)', s.AdmissionNo, s.FullName, 'Student record created via Excel import.');
+            successCount++;
+        } catch (err) {
+            errors.push(`Admission No ${s.AdmissionNo || '(missing)'}: ${err.code === 'ER_DUP_ENTRY' ? 'Already exists.' : err.message}`);
+        }
+    }
+
+    res.status(201).json({
+        message: `Import complete. ${successCount} added, ${errors.length} failed.`,
+        errors
+    });
+});
+
+app.get('/api/student-activity-logs', async (req, res) => {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+
+    try {
+        const [[{ totalItems }]] = await db.promise().query('SELECT COUNT(*) as totalItems FROM StudentActivityLogs');
+        const [logs] = await db.promise().query('SELECT * FROM StudentActivityLogs ORDER BY Timestamp DESC LIMIT ? OFFSET ?', [limit, offset]);
+        
+        res.status(200).json({
+            logs,
+            totalPages: Math.ceil(totalItems / limit),
+            currentPage: page
+        });
+    } catch (error) {
+        console.error('❌ Error fetching student activity logs:', error.message);
+        res.status(500).json({ message: 'Failed to fetch student activity logs' });
+    }
+});
 
 app.delete('/api/delete-student/:admissionNo', (req, res) => {
   const { admissionNo } = req.params;
@@ -750,85 +834,6 @@ app.delete('/api/delete-student/:admissionNo', (req, res) => {
   });
 });
 
-app.post('/api/import-teachers', async (req, res) => {
-  const { teachers } = req.body;
-  if (!Array.isArray(teachers) || teachers.length === 0) return res.status(400).json({ message: 'No teacher data provided or invalid format.' });
-  let successfulInserts = 0, skippedExisting = 0, failedOperations = 0;
-  const errors = [], infoMessages = [];
-  for (const [index, teacherData] of teachers.entries()) {
-    const { teacherID: excelTeacherID, fullName, fathersName, qualification, dateOfBirth, dateOfJoining, phone, whatsapp, type, username: usernameFromFile, password: passwordFromFile, assignedClasses } = teacherData;
-    if (!fullName || !type) { errors.push(`Row ${index + 2}: Missing FullName or Type. Skipping.`); failedOperations++; continue; }
-    const validTypes = ['Teaching', 'Non-Teaching', 'Admin', 'Principal']; let finalType = type;
-    if (!validTypes.includes(type)) { infoMessages.push(`Row ${index + 2} (Name: ${fullName}): Invalid Type '${type}'. Defaulting to 'Teaching'.`); finalType = 'Teaching'; }
-    const role = (finalType === 'Admin' || finalType === 'Principal') ? 'admin' : 'teacher';
-    const dbPassword = (passwordFromFile && String(passwordFromFile).trim() !== "") ? String(passwordFromFile).trim() : null;
-    const formattedDob = formatDateForDB(dateOfBirth), formattedDoj = formatDateForDB(dateOfJoining);
-    try {
-        let foundExistingTeacher = false, existingTeacherDetails = "";
-        if (excelTeacherID) { const [rowsById] = await db.promise().query('SELECT Id FROM Teachers WHERE Id = ?', [excelTeacherID]); if (rowsById.length > 0) { foundExistingTeacher = true; existingTeacherDetails = `with matching ID: ${rowsById[0].Id}`; }}
-        if (!foundExistingTeacher && usernameFromFile) { const [rowsByUsername] = await db.promise().query('SELECT Id, Username FROM Teachers WHERE Username = ?', [usernameFromFile]); if (rowsByUsername.length > 0) { foundExistingTeacher = true; existingTeacherDetails = `with matching Username: '${rowsByUsername[0].Username}'`; }}
-        if (!foundExistingTeacher && fullName && formattedDob) { const [rowsByNameDob] = await db.promise().query('SELECT Id FROM Teachers WHERE FullName = ? AND DateOfBirth = ?', [fullName, formattedDob]); if (rowsByNameDob.length > 0) { foundExistingTeacher = true; existingTeacherDetails = `with matching Name and DOB`; }}
-        if (foundExistingTeacher) { infoMessages.push(`Row ${index + 2} (Name: ${fullName}): Skipped. An existing teacher was found ${existingTeacherDetails}.`); skippedExisting++; continue; }
-    } catch (findErr) { errors.push(`Row ${index + 2} (Name: ${fullName}): Error checking for existing teacher - ${findErr.message}`); failedOperations++; console.error("Error finding teacher:", findErr); continue; }
-    try {
-      const tempUsernameForInsert = `_new_${Date.now()}_${index}`;
-      const insertSql = `INSERT INTO Teachers (FullName, FathersName, Qualification, DateOfBirth, DateOfJoining, Phone, Whatsapp, Type, Username, Password, Role, ManagedClasses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-      const [insertResult] = await db.promise().query(insertSql, [fullName, fathersName || null, qualification || null, formattedDob, formattedDoj, phone || null, whatsapp || phone || null, finalType, tempUsernameForInsert, dbPassword, role, JSON.stringify(assignedClasses || [])]);
-      const newTeacherId = insertResult.insertId;
-      if (newTeacherId) { const finalUsername = `teacher${newTeacherId}`; await db.promise().query('UPDATE Teachers SET Username = ? WHERE Id = ?', [finalUsername, newTeacherId]); infoMessages.push(`Row ${index + 2} (Name: ${fullName}): Added as new teacher (ID: ${newTeacherId}). Username set to ${finalUsername}.`); successfulInserts++; }
-      else { throw new Error("Insert operation did not return a new ID."); }
-    } catch (insertErr) { let errMsg = insertErr.message; if (insertErr.code === 'ER_DUP_ENTRY') errMsg = `Duplicate entry error during insert. ${insertErr.message}`; errors.push(`Row ${index + 2} (Name: ${fullName}): Error adding new teacher - ${errMsg}`); failedOperations++; console.error(`Error inserting new teacher ${fullName}:`, insertErr); }
-  }
-  res.status(200).json({ message: 'Import process completed.', successfulInserts, skippedExisting, failedOperations, errors, infoMessages });
-});
-app.get('/api/get-teachers', (req, res) => {
-  const sql = `SELECT Id, FullName, FathersName, Qualification, DateOfBirth, DateOfJoining, Phone, Whatsapp, Type, Username, Role, ManagedClasses FROM Teachers ORDER BY DateOfJoining DESC`;
-  db.query(sql, (err, results) => {
-    if (err) { console.error('❌ Error fetching teachers:', err.message); return res.status(500).json({ message: 'Teacher fetch failed', error: err.message }); }
-    res.status(200).json(results);
-  });
-});
-app.post('/api/add-teacher', (req, res) => {
-  const t = req.body; if (!t.fullName || !t.username || !t.password || !t.type) return res.status(400).json({ message: 'Full Name, Username, Password, and Type are required.' });
-  const role = (t.type === 'Admin' || t.type === 'Principal') ? 'admin' : 'teacher';
-  const sql = `INSERT INTO Teachers (FullName, FathersName, Qualification, DateOfBirth, DateOfJoining, Phone, Whatsapp, Type, Username, Password, Role, ManagedClasses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-  const values = [t.fullName, t.fathersName || null, t.qualification || null, formatDateForDB(t.dateOfBirth), formatDateForDB(t.dateOfJoining), t.phone || null, t.whatsapp || t.phone || null, t.type, t.username, t.password, role, JSON.stringify(t.assignedClasses || [])];
-  db.query(sql, values, (err, result) => {
-    if (err) { if(err.code === 'ER_DUP_ENTRY'){ if (err.message.toLowerCase().includes('username')) return res.status(409).json({ message: 'This username is already taken.' }); return res.status(409).json({ message: 'Failed to add teacher. A similar record might already exist.' });} console.error('❌ Error adding teacher:', err.message, "Input:", t); return res.status(500).json({ message: 'Teacher insert failed', error: err.message }); }
-    const insertedTeacherData = { id: result.insertId, fullName: t.fullName, fathersName: t.fathersName || null, qualification: t.qualification || null, dateOfBirth: formatDateForDB(t.dateOfBirth), dateOfJoining: formatDateForDB(t.dateOfJoining), phone: t.phone || null, whatsapp: t.whatsapp || t.phone || null, type: t.type, username: t.username, role: role, managedClasses: t.assignedClasses || [] };
-    res.status(201).json({ message: '✅ Teacher added successfully', teacher: insertedTeacherData });
-  });
-});
-app.put('/api/update-teacher', (req, res) => {
-  const t = req.body; const teacherId = t.id; if (!teacherId) return res.status(400).json({ message: 'Teacher ID (as "id") is required for an update.' });
-  const fieldsToUpdate = [], sqlValues = []; const fieldMap = { fullName: 'FullName', fathersName: 'FathersName', qualification: 'Qualification', dateOfBirth: 'DateOfBirth', dateOfJoining: 'DateOfJoining', phone: 'Phone', whatsapp: 'Whatsapp', type: 'Type', username: 'Username', password: 'Password', assignedClasses: 'ManagedClasses' };
-  for (const key in t) {
-    if (key === 'id') continue; if (t.hasOwnProperty(key) && fieldMap[key]) {
-      let value = t[key]; const dbColumn = fieldMap[key]; if (key === 'password' && value === '') continue;
-      if (key === 'type') { fieldsToUpdate.push('Role = ?'); sqlValues.push((value === 'Admin' || value === 'Principal') ? 'admin' : 'teacher'); }
-      fieldsToUpdate.push(`${dbColumn} = ?`);
-      if (key === 'dateOfBirth' || key === 'dateOfJoining') sqlValues.push(formatDateForDB(value));
-      else if (key === 'whatsapp' && value === '') sqlValues.push(null);
-      else if (key === 'whatsapp' && value === t.phone && key !== 'phone') sqlValues.push(t.phone || null);
-      else if (key === 'assignedClasses') sqlValues.push(JSON.stringify(value || [])); else sqlValues.push(value);
-    }
-  }
-  if (fieldsToUpdate.length === 0) return res.status(200).json({ message: 'No valid fields provided for update or only ID was sent.' });
-  sqlValues.push(teacherId); const sql = `UPDATE Teachers SET ${fieldsToUpdate.join(', ')} WHERE Id = ?`;
-  db.query(sql, sqlValues, (err, result) => {
-    if (err) { if (err.code === 'ER_DUP_ENTRY') { if (err.message.toLowerCase().includes('username')) return res.status(409).json({ message: 'That username is already taken by another teacher.' }); return res.status(409).json({ message: 'Update failed. A unique field (e.g., username) might be duplicated.' });} console.error('❌ Error updating teacher:', err.message, "Input:", t, "SQL:", sql, "Values:", sqlValues); return res.status(500).json({ message: 'Teacher update failed', error: err.message }); }
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'Teacher not found.' });
-    res.status(200).json({ message: '✅ Teacher updated successfully.' });
-  });
-});
-app.delete('/api/delete-teacher/:id', (req, res) => {
-  const { id } = req.params;
-  db.query('DELETE FROM Teachers WHERE Id = ?', [id], (err, result) => {
-    if (err) return res.status(500).json({ message: 'Teacher delete failed', error: err.message });
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'Teacher not found.' });
-    res.status(200).json({ message: '✅ Teacher deleted successfully.' });
-  });
-});
 
 app.use((req, res) => { res.status(404).json({ message: `❌ Route not found: ${req.method} ${req.originalUrl}`}); });
 app.use((err, req, res, next) => { console.error("💥 GLOBAL ERROR HANDLER:", err.stack); res.status(500).json({ message: "❌ An unexpected server error occurred." }); });
