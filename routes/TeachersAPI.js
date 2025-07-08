@@ -46,8 +46,30 @@ module.exports = function(db) {
         }
     });
     const upload = multer({ storage: storage });
+    router.get('/teachers', async (req, res) => {
+        const sql = `SELECT Id AS TeacherID, FullName, Designation 
+                     FROM Teachers 
+                     WHERE Status = 'Active' 
+                     ORDER BY Designation, FullName ASC`;
+        try {
+            const [results] = await db.promise().query(sql);
 
-    // GET all teachers (no changes needed here)
+            // Group the flat list of teachers into a structured object
+            const groupedTeachers = results.reduce((acc, teacher) => {
+                const group = teacher.Designation || 'Other'; // Group by Designation
+                if (!acc[group]) {
+                    acc[group] = []; // Create the group if it doesn't exist
+                }
+                acc[group].push(teacher);
+                return acc;
+            }, {});
+
+            res.status(200).json(groupedTeachers);
+        } catch (err) {
+            console.error('❌ Error fetching and grouping teacher list:', err.message);
+            res.status(500).json({ message: 'Failed to fetch teacher list', error: err.message });
+        }
+    });
     router.get('/get-teachers', async (req, res) => {
         const sql = `
             SELECT 

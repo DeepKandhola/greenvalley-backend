@@ -21,6 +21,7 @@ const { registerTaskRoutes } = require('./routes/TasksAPI.js');
 const { initializeDynamicScheduler } = require('./routes/dynamicTaskScheduler');
 const dashboardRoutes = require('./routes/DashboardAPI.js')(db);
 const teacherRoutes = require('./routes/TeachersAPI.js')(db);
+const XLSX = require('xlsx');
 
 // 3. Use Middleware & Mount Routers
 app.use(cors());
@@ -121,50 +122,6 @@ app.post('/api/upload-photo', studentPhotoUpload.single('profilePhoto'), (req, r
   res.status(200).json({ filePath: filePath });
 });
 
-app.post('/api/student-login', async (req, res) => {
-  const { username, password: providedPassword } = req.body;
-
-  if (!username || !providedPassword) {
-    return res.status(400).json({ message: 'Username and password are required.' });
-  }
-
-  try {
-    // Query the Students table for a matching username
-    const [rows] = await db.promise().query(
-      'SELECT AdmissionNo, FullName, Username, Password FROM Students WHERE Username = ?',
-      [username]
-    );
-
-    // If no student with that username is found, return an error
-    if (rows.length === 0) {
-      return res.status(401).json({ message: 'Invalid username or password.' });
-    }
-
-    const student = rows[0];
-    const dbPassword = student.Password;
-
-    // Compare the provided password with the one from the database
-    if (providedPassword === dbPassword) {
-      // If passwords match, create the user data object for the frontend
-      const userData = {
-        id: student.AdmissionNo, // Use AdmissionNo as the unique ID for students
-        name: student.FullName,
-        username: student.Username,
-        role: 'student', // Hardcode the role as 'student'
-        managedClasses: [], // Students do not manage classes
-      };
-      // Send a success response with the user data
-      res.status(200).json(userData);
-    } else {
-      // If passwords do not match, return an error
-      res.status(401).json({ message: 'Invalid username or password.' });
-    }
-  } catch (error) {
-    console.error('❌ Student Login API Error:', error);
-    res.status(500).json({ message: 'An error occurred during the login process.' });
-  }
-});
-
 app.post('/api/login', async (req, res) => {
   const { username, password: providedPassword } = req.body;
 
@@ -173,8 +130,9 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
+    // MODIFICATION: Also select the 'Status' column
     const [rows] = await db.promise().query(
-      'SELECT Id, FullName, Username, Password, Role, ManagedClasses FROM Teachers WHERE Username = ?',
+      'SELECT Id, FullName, Username, Password, Role, ManagedClasses, Status FROM Teachers WHERE Username = ?',
       [username]
     );
 
@@ -183,6 +141,17 @@ app.post('/api/login', async (req, res) => {
     }
 
     const teacher = rows[0];
+
+    // NEW: Check if the teacher's status is 'Active'
+    if (teacher.Status !== 'Active') {
+      // Return a specific 403 Forbidden status with a clear reason
+      return res.status(403).json({ 
+        message: 'Your account is inactive.',
+        reason: 'INACTIVE_ACCOUNT' // A machine-readable reason for the frontend
+      });
+    }
+    
+    // --- Password comparison logic remains the same ---
     const dbPassword = teacher.Password;
     let isMatch = false;
 
@@ -219,6 +188,57 @@ app.post('/api/login', async (req, res) => {
     res.status(500).json({ message: 'An error occurred during the login process.' });
   }
 });
+app.post('/api/student-login', async (req, res) => {
+  const { username, password: providedPassword } = req.body;
+
+  if (!username || !providedPassword) {
+    return res.status(400).json({ message: 'Username and password are required.' });
+  }
+
+  try {
+    // MODIFICATION: Also select the 'IsActive' column
+    const [rows] = await db.promise().query(
+      'SELECT AdmissionNo, FullName, Username, Password, IsActive FROM Students WHERE Username = ?',
+      [username]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid username or password.' });
+    }
+
+    const student = rows[0];
+
+    // NEW: Check if the student's status is active (IsActive = 1)
+    if (student.IsActive !== 1) {
+      // Return a specific 403 Forbidden status with a clear reason
+      return res.status(403).json({ 
+        message: 'Your account is inactive.',
+        reason: 'INACTIVE_ACCOUNT' 
+      });
+    }
+
+    // --- Password comparison logic remains the same ---
+    const dbPassword = student.Password;
+
+    if (providedPassword === dbPassword) {
+      const userData = {
+        id: student.AdmissionNo,
+        name: student.FullName,
+        username: student.Username,
+        role: 'student',
+        managedClasses: [],
+      };
+      res.status(200).json(userData);
+    } else {
+      res.status(401).json({ message: 'Invalid username or password.' });
+    }
+  } catch (error) {
+    console.error('❌ Student Login API Error:', error);
+    res.status(500).json({ message: 'An error occurred during the login process.' });
+  }
+});
+
+
 app.get('/api/teacher/my-students', async (req, res) => {
     const { classes } = req.query;
 
@@ -833,6 +853,167 @@ app.delete('/api/delete-student/:admissionNo', (req, res) => {
     res.status(200).json({ message: '✅ Student deleted' });
   });
 });
+
+
+//======================================================================
+//  TEACHER ATTENDANCE API - Add these new routes to your server.js
+//======================================================================
+
+app.post('/api/teacher-attendance', (req, res) => {
+  const { records, teacherName } = req.body;
+
+  if (!Array.isArray(records) || records.length === 0) {
+    return res.status(400).json({ message: 'No attendance records provided.' });
+  }
+
+  const sql = `
+    INSERT INTO TeacherAttendance (TeacherID, AttendanceDate, Status, MarkedBy, Note)
+    VALUES ?
+    ON DUPLICATE KEY UPDATE Status = VALUES(Status), MarkedBy = VALUES(MarkedBy), Note = VALUES(Note)`;
+
+  // Include the 'note' field in the values array
+  const values = records.map(rec => [rec.teacherId, rec.date, rec.status, teacherName || 'Admin', rec.note || null]);
+
+  db.query(sql, [values], (err, result) => {
+    if (err) {
+      console.error('❌ Error saving teacher attendance:', err.message);
+      return res.status(500).json({ message: 'Failed to save teacher attendance', error: err.message });
+    }
+    res.status(201).json({ message: '✅ Teacher attendance saved successfully', affectedRows: result.affectedRows });
+  });
+});
+
+// 3. CHANGED: GET /api/teacher-attendance-report - Now fetches the Note
+app.get('/api/teacher-attendance-report', (req, res) => {
+  const sql = `
+    SELECT a.Id, a.AttendanceDate, a.Status, a.MarkedBy, a.Note, t.Id AS TeacherID, t.FullName
+    FROM TeacherAttendance a 
+    JOIN Teachers t ON a.TeacherID = t.Id
+    ORDER BY a.AttendanceDate DESC, t.FullName;`;
+
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error('❌ Error fetching teacher attendance report:', err.message);
+      return res.status(500).json({ message: 'Failed to fetch report', error: err.message });
+    }
+    res.status(200).json(results);
+  });
+});
+
+// 4. CHANGED: GET /api/teacher-attendance/:date - Now fetches Status and Note
+app.get('/api/teacher-attendance/:date', (req, res) => {
+  const { date } = req.params;
+  // Fetch both Status and Note for the modal
+  const sql = "SELECT TeacherID, Status, Note FROM TeacherAttendance WHERE AttendanceDate = ?";
+  
+  db.query(sql, [date], (err, results) => {
+    if (err) {
+      console.error(`❌ Error fetching teacher attendance for ${date}:`, err.message);
+      return res.status(500).json({ message: 'Database query failed' });
+    }
+    // Create a map that includes both status and note
+    const attendanceMap = results.reduce((acc, record) => {
+        acc[record.TeacherID] = { status: record.Status, note: record.Note };
+        return acc;
+    }, {});
+    res.status(200).json(attendanceMap);
+  });
+});
+
+app.post('/api/export-attendance', async (req, res) => {
+  try {
+      const { type, startDate, endDate, scopes, statuses } = req.body;
+
+      if (!type || !startDate || !endDate) {
+          return res.status(400).json({ message: 'Type, Start Date, and End Date are required.' });
+      }
+
+      let queryParams = [startDate, endDate];
+      let baseQuery, whereClauses = ["a.AttendanceDate BETWEEN ? AND ?"];
+      let headers;
+
+      // --- Configure query based on entity type (Student or Teacher) ---
+      if (type === 'student') {
+          baseQuery = `
+              SELECT 
+                  DATE_FORMAT(a.AttendanceDate, '%d-%m-%Y') as Date,
+                  s.AdmissionNo as 'Admission No',
+                  s.FullName as 'Student Name',
+                  s.CurrentClass as 'Class',
+                  s.Section,
+                  a.Status,
+                  a.Note,
+                  a.MarkedByTeacher as 'Marked By'
+              FROM Attendance a
+              JOIN Students s ON a.StudentAdmissionNo = s.AdmissionNo
+          `;
+          headers = ['Date', 'Admission No', 'Student Name', 'Class', 'Section', 'Status', 'Note', 'Marked By'];
+
+          // Add scope (class) filter if provided
+          if (scopes && scopes.length > 0) {
+              whereClauses.push(`CONCAT(s.CurrentClass, '-', s.Section) IN (?)`);
+              queryParams.push(scopes);
+          }
+
+      } else if (type === 'teacher') {
+          baseQuery = `
+              SELECT 
+                  DATE_FORMAT(a.AttendanceDate, '%d-%m-%Y') as Date,
+                  t.Id as 'Teacher ID',
+                  t.FullName as 'Teacher Name',
+                  a.Status,
+                  a.Note,
+                  a.MarkedBy as 'Marked By'
+              FROM TeacherAttendance a
+              JOIN Teachers t ON a.TeacherID = t.Id
+          `;
+          headers = ['Date', 'Teacher ID', 'Teacher Name', 'Status', 'Note', 'Marked By'];
+          // Teachers don't have scopes, so no filter is added here.
+      } else {
+          return res.status(400).json({ message: 'Invalid entity type specified.' });
+      }
+
+      // Add status filter if provided
+      if (statuses && statuses.length > 0) {
+          whereClauses.push(`a.Status IN (?)`);
+          queryParams.push(statuses);
+      }
+
+      // --- Assemble the final SQL query ---
+      const finalQuery = `${baseQuery} WHERE ${whereClauses.join(' AND ')} ORDER BY a.AttendanceDate, FullName;`;
+      
+      const [results] = await db.promise().query(finalQuery, queryParams);
+
+      if (results.length === 0) {
+          return res.status(404).json({ message: 'No records found for the selected criteria.' });
+      }
+      
+      // --- Generate Excel File Buffer ---
+      const worksheet = XLSX.utils.json_to_sheet(results);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Attendance Report');
+
+      // Auto-fit columns
+      const columnWidths = headers.map(header => ({
+          wch: Math.max(header.length, ...results.map(row => row[header] ? row[header].toString().length : 0)) + 2
+      }));
+      worksheet['!cols'] = columnWidths;
+
+      // Write the workbook to a buffer
+      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+      // --- Send the file to the client ---
+      const fileName = `${type}_attendance_${startDate}_to_${endDate}.xlsx`;
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.send(buffer);
+
+  } catch (error) {
+      console.error('❌ Error generating attendance export:', error.message);
+      res.status(500).json({ message: 'Failed to generate the report.' });
+  }
+});
+
 
 
 app.use((req, res) => { res.status(404).json({ message: `❌ Route not found: ${req.method} ${req.originalUrl}`}); });
