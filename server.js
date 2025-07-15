@@ -1,4 +1,3 @@
-// server.js
 const express=require('express');
 const cors=require('cors');
 const path=require('path');
@@ -28,15 +27,12 @@ const attachmentsDir=path.join(publicDir,'attachments','tasks');
 const studentPhotosDir=path.join(publicDir,'uploads','students');
 if(!fs.existsSync(publicDir)){
 fs.mkdirSync(publicDir,{recursive:true});
-console.log(`✅ Created public directory: ${publicDir}`);
 }
 if(!fs.existsSync(attachmentsDir)){
 fs.mkdirSync(attachmentsDir,{recursive:true});
-console.log(`✅ Created attachments directory: ${attachmentsDir}`);
 }
 if(!fs.existsSync(studentPhotosDir)){
 fs.mkdirSync(studentPhotosDir,{recursive:true});
-console.log(`✅ Created student photos directory: ${studentPhotosDir}`);
 }
 app.use('/public',express.static(publicDir));
 db.getConnection((err,connection)=>{
@@ -60,7 +56,6 @@ totalPages:Math.ceil(totalItems/limit),
 currentPage:page
 });
 }catch(error){
-console.error('❌ Error fetching activity logs:',error.message);
 res.status(500).json({message:'Failed to fetch activity logs',error:error.message});
 }
 });
@@ -121,7 +116,6 @@ try{
 managedClassesArray=JSON.parse(teacher.ManagedClasses);
 if(!Array.isArray(managedClassesArray))managedClassesArray=[];
 }catch(e){
-console.error("Failed to parse ManagedClasses JSON for user:",teacher.Username,e);
 managedClassesArray=[];
 }
 }
@@ -137,7 +131,6 @@ res.status(200).json(userData);
 res.status(401).json({message:'Invalid username or password.'});
 }
 }catch(error){
-console.error('❌ Login API Error:',error);
 res.status(500).json({message:'An error occurred during the login process.'});
 }
 });
@@ -175,7 +168,6 @@ res.status(200).json(userData);
 res.status(401).json({message:'Invalid username or password.'});
 }
 }catch(error){
-console.error('❌ Student Login API Error:',error);
 res.status(500).json({message:'An error occurred during the login process.'});
 }
 });
@@ -193,7 +185,6 @@ const [students]=await db.promise().query(
 );
 res.status(200).json(students);
 }catch(error){
-console.error("Error fetching students for teacher:",error);
 res.status(500).json({message:"Failed to fetch student data."});
 }
 });
@@ -257,7 +248,6 @@ onLeaveStudents:attendanceData.onLeaveStudents||0
 };
 res.status(200).json(finalStats);
 }catch(err){
-console.error(`❌ Error fetching dashboard stats for teacher ID ${teacherId}:`,err.message);
 res.status(500).json({message:"Failed to fetch dashboard statistics."});
 }
 });
@@ -286,7 +276,6 @@ res.status(200).json(teacher);
 res.status(404).json({message:'Teacher not found.'});
 }
 }catch(error){
-console.error(`Error fetching full details for teacher ${teacherId}:`,error);
 res.status(500).json({message:'Failed to fetch teacher details.'});
 }
 });
@@ -313,42 +302,101 @@ res.status(200).json({message:"✅ Credentials updated successfully!"});
 if(error.code==='ER_DUP_ENTRY'&&error.message.includes('Username')){
 return res.status(409).json({message:'That username is already taken. Please choose another.'});
 }
-console.error(`Error changing credentials for teacher ${teacherId}:`,error);
 res.status(500).json({message:"Failed to update credentials."});
 }
 });
-app.post('/api/attendance',(req,res)=>{
-const attendanceRecords=req.body.records;
-const teacherName=req.body.teacherName;
-if(!Array.isArray(attendanceRecords)||attendanceRecords.length===0){
-return res.status(400).json({message:'No attendance records provided.'});
-}
-const indiaTimeZone='Asia/Kolkata';
-const lockInDays=3;
-const nowInIndia=toDate(new Date(),{timeZone:indiaTimeZone});
-const todayStr=format(nowInIndia,'yyyy-MM-dd');
-const cutoffDate=subDays(nowInIndia,lockInDays);
-const cutoffDateStr=format(cutoffDate,'yyyy-MM-dd');
-const attendanceDate=attendanceRecords[0].date;
-if(attendanceDate>todayStr){
-return res.status(403).json({message:`Cannot mark attendance for a future date.`});
-}
-if(attendanceDate<cutoffDateStr){
-return res.status(403).json({message:`Attendance for this date is locked. You can only edit records for the past ${lockInDays} days.`});
-}
-const sql=`
-    INSERT INTO Attendance (StudentAdmissionNo, AttendanceDate, Status, MarkedByTeacher)
-    VALUES ?
-    ON DUPLICATE KEY UPDATE Status = VALUES(Status), MarkedByTeacher = VALUES(MarkedByTeacher)`;
-const values=attendanceRecords.map(rec=>[rec.admissionNo,rec.date,rec.status,teacherName]);
-db.query(sql,[values],(err,result)=>{
-if(err){
-console.error('❌ Error saving attendance:',err.message);
-return res.status(500).json({message:'Failed to save attendance',error:err.message});
-}
-res.status(201).json({message:'✅ Attendance saved successfully',affectedRows:result.affectedRows});
+app.post('/api/attendance', async (req, res) => {
+    const attendanceRecords = req.body.records;
+    const teacherName = req.body.teacherName;
+
+    if (!Array.isArray(attendanceRecords) || attendanceRecords.length === 0) {
+        return res.status(400).json({ message: 'No attendance records provided.' });
+    }
+
+    const connection = await db.promise().getConnection();
+    try {
+        await connection.beginTransaction();
+
+        for (const rec of attendanceRecords) {
+            // 1. Read: Check if a record already exists for this student on this date
+            const [existing] = await connection.query(
+                'SELECT Id FROM Attendance WHERE StudentAdmissionNo = ? AND AttendanceDate = ?',
+                [rec.admissionNo, rec.date]
+            );
+
+            if (existing.length > 0) {
+                // 2a. Write (UPDATE): Record found, so we update it
+                const existingId = existing[0].Id;
+                await connection.query(
+                    'UPDATE Attendance SET Status = ?, MarkedByTeacher = ?, Note = ? WHERE Id = ?',
+                    [rec.status, teacherName, rec.note || null, existingId]
+                );
+            } else {
+                // 2b. Write (INSERT): No record found, so we insert a new one
+                await connection.query(
+                    'INSERT INTO Attendance (StudentAdmissionNo, AttendanceDate, Status, MarkedByTeacher, Note) VALUES (?, ?, ?, ?, ?)',
+                    [rec.admissionNo, rec.date, rec.status, teacherName, rec.note || null]
+                );
+            }
+        }
+
+        await connection.commit();
+        res.status(201).json({ message: '✅ Attendance saved successfully' });
+
+    } catch (err) {
+        await connection.rollback();
+        console.error('❌ Failed to save student attendance:', err.message);
+        res.status(500).json({ message: 'Failed to save attendance', error: err.message });
+    } finally {
+        connection.release();
+    }
 });
+
+// --- REWRITTEN: Teacher Attendance Saving Logic (No DB change needed) ---
+app.post('/api/teacher-attendance', async (req, res) => {
+    const { records, teacherName } = req.body;
+    if (!Array.isArray(records) || records.length === 0) {
+        return res.status(400).json({ message: 'No attendance records provided.' });
+    }
+
+    const connection = await db.promise().getConnection();
+    try {
+        await connection.beginTransaction();
+        
+        for (const rec of records) {
+            // 1. Read: Check if a record exists
+            const [existing] = await connection.query(
+                'SELECT Id FROM TeacherAttendance WHERE TeacherID = ? AND AttendanceDate = ?',
+                [rec.teacherId, rec.date]
+            );
+
+            if (existing.length > 0) {
+                // 2a. Write (UPDATE): Record found
+                const existingId = existing[0].Id;
+                await connection.query(
+                    'UPDATE TeacherAttendance SET Status = ?, MarkedBy = ?, Note = ? WHERE Id = ?',
+                    [rec.status, teacherName || 'Admin', rec.note || null, existingId]
+                );
+            } else {
+                // 2b. Write (INSERT): No record found
+                await connection.query(
+                    'INSERT INTO TeacherAttendance (TeacherID, AttendanceDate, Status, MarkedBy, Note) VALUES (?, ?, ?, ?, ?)',
+                    [rec.teacherId, rec.date, rec.status, teacherName || 'Admin', rec.note || null]
+                );
+            }
+        }
+        
+        await connection.commit();
+        res.status(201).json({ message: '✅ Teacher attendance saved successfully' });
+    } catch (err) {
+        await connection.rollback();
+        console.error('❌ Failed to save teacher attendance:', err.message);
+        res.status(500).json({ message: 'Failed to save teacher attendance', error: err.message });
+    } finally {
+        connection.release();
+    }
 });
+
 app.get('/api/students-by-class/:classSection',(req,res)=>{
 const {classSection}=req.params;
 if(!classSection||!classSection.includes('-')){
@@ -358,34 +406,87 @@ const [currentClass,section]=classSection.split('-');
 const sql='SELECT AdmissionNo, FullName FROM Students WHERE CurrentClass = ? AND Section = ? ORDER BY FullName';
 db.query(sql,[currentClass,section],(err,results)=>{
 if(err){
-console.error(`❌ Error fetching students for class ${classSection}:`,err.message);
 return res.status(500).json({message:'Database query failed'});
 }
 res.status(200).json(results);
 });
 });
-app.get('/api/attendance-report',(req,res)=>{
-const sql=`
-    SELECT a.Id, a.AttendanceDate, a.Status, a.MarkedByTeacher, s.AdmissionNo, s.FullName, s.CurrentClass, s.Section
-    FROM Attendance a JOIN Students s ON a.StudentAdmissionNo = s.AdmissionNo
-    ORDER BY a.AttendanceDate DESC, s.CurrentClass, s.Section, s.FullName;`;
-db.query(sql,(err,results)=>{
-if(err){
-console.error('❌ Error fetching attendance report:',err.message);
-return res.status(500).json({message:'Failed to fetch report',error:err.message});
-}
-res.status(200).json(results);
+app.get('/api/attendance-report', (req, res) => {
+    // Destructure the optional query parameters from the request
+    const { startDate, endDate, scopes, statuses } = req.query;
+
+    let sql = `
+        SELECT 
+            a.Id, 
+            a.AttendanceDate, 
+            a.Status, 
+            a.MarkedByTeacher, 
+            a.Note, 
+            s.AdmissionNo, 
+            s.FullName, 
+            s.CurrentClass, 
+            s.Section,
+            s.Phone as FatherMobile, -- Assuming 'Phone' can be used as FatherMobile
+            s.Whatsapp as MotherMobile -- Assuming 'Whatsapp' can be used as MotherMobile
+        FROM Attendance a 
+        JOIN Students s ON a.StudentAdmissionNo = s.AdmissionNo
+    `;
+
+    const whereClauses = [];
+    const queryParams = [];
+
+    // 1. Handle Date Range Filter (used by the export modal)
+    if (startDate && endDate) {
+        whereClauses.push('a.AttendanceDate BETWEEN ? AND ?');
+        queryParams.push(startDate, endDate);
+    }
+
+    // 2. Handle Scope (Class) Filter (used by the export modal)
+    if (scopes) {
+        const scopeList = scopes.split(',');
+        if (scopeList.length > 0) {
+            whereClauses.push(`CONCAT(s.CurrentClass, '-', s.Section) IN (?)`);
+            queryParams.push(scopeList);
+        }
+    }
+    
+    // 3. Handle Status Filter (used by the export modal)
+    if (statuses) {
+        const statusList = statuses.split(',');
+        if (statusList.length > 0) {
+            whereClauses.push('a.Status IN (?)');
+            queryParams.push(statusList);
+        }
+    }
+    
+    // 4. Combine all filters into the final SQL query
+    if (whereClauses.length > 0) {
+        sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    // The main report page will call this route without any filters, so it will fetch everything.
+    // The export modal will call it with filters, and the query will be adjusted accordingly.
+    
+    sql += ' ORDER BY a.AttendanceDate DESC, s.CurrentClass, s.Section, s.FullName;';
+
+    db.query(sql, queryParams, (err, results) => {
+        if (err) {
+            console.error("Error fetching attendance report:", err);
+            return res.status(500).json({ message: 'Failed to fetch report', error: err.message });
+        }
+        res.status(200).json(results);
+    });
 });
-});
+
+
 app.get('/api/attendance/:classSection/:date',(req,res)=>{
 const {classSection,date}=req.params;
-const sql="SELECT StudentAdmissionNo, Status FROM Attendance WHERE StudentAdmissionNo IN (SELECT AdmissionNo FROM Students WHERE CONCAT(CurrentClass, '-', Section) = ?) AND AttendanceDate = ?";
+const sql="SELECT StudentAdmissionNo, Status, Note FROM Attendance WHERE StudentAdmissionNo IN (SELECT AdmissionNo FROM Students WHERE CONCAT(CurrentClass, '-', Section) = ?) AND AttendanceDate = ?";
 db.query(sql,[classSection,date],(err,results)=>{
 if(err){
-console.error(`❌ Error fetching attendance for ${classSection} on ${date}:`,err.message);
 return res.status(500).json({message:'Database query failed'});
 }
-const attendanceMap=results.reduce((acc,record)=>{acc[record.StudentAdmissionNo]=record.Status;return acc;},{});
+const attendanceMap=results.reduce((acc,record)=>{acc[record.StudentAdmissionNo]={status:record.Status,note:record.Note};return acc;},{});
 res.status(200).json(attendanceMap);
 });
 });
@@ -396,7 +497,6 @@ const sql=`
     ORDER BY CAST(REGEXP_SUBSTR(CurrentClass, '^[0-9]+') AS UNSIGNED) ASC, REGEXP_SUBSTR(CurrentClass, '[A-Za-z]+$') ASC, Section ASC;`;
 db.query(sql,(err,results)=>{
 if(err){
-console.error('❌ Error fetching distinct classes with sections:',err.message);
 return res.status(500).json({message:'Failed to fetch class list',error:err.message});
 }
 const classes=results.map(row=>({value:row.ClassSection,label:row.ClassSection}));
@@ -422,7 +522,6 @@ res.status(200).json(rows[0]);
 res.status(404).json({message:'Student not found.'});
 }
 }catch(error){
-console.error(`Error fetching full details for student ${admissionNo}:`,error);
 res.status(500).json({message:'Failed to fetch student details.'});
 }
 });
@@ -439,7 +538,6 @@ res.status(200).json(rows[0]);
 res.status(404).json({message:'Student not found.'});
 }
 }catch(error){
-console.error(`Error fetching details for student ${admissionNo}:`,error);
 res.status(500).json({message:'Failed to fetch student details.'});
 }
 });
@@ -457,7 +555,6 @@ res.status(200).json({status:rows[0].Status});
 res.status(200).json({status:'Not Marked'});
 }
 }catch(error){
-console.error(`Error fetching today's attendance for ${admissionNo}:`,error);
 res.status(500).json({message:"Failed to fetch today's attendance"});
 }
 });
@@ -474,7 +571,6 @@ return acc;
 },{});
 res.status(200).json({attendance:attendanceMap,holidays:{}});
 }catch(error){
-console.error(`Error fetching attendance history for ${admissionNo}:`,error);
 res.status(500).json({message:'Failed to fetch attendance history'});
 }
 });
@@ -495,7 +591,6 @@ res.status(200).json({isSchoolOff:true,reason:rows[0].Description});
 res.status(200).json({isSchoolOff:false,reason:'Working Day'});
 }
 }catch(error){
-console.error(`Error checking status for date ${date}:`,error);
 res.status(500).json({message:'Failed to check day status.'});
 }
 });
@@ -517,7 +612,6 @@ res.status(200).json({message:'✅ Credentials updated successfully!'});
 if(error.code==='ER_DUP_ENTRY'){
 return res.status(409).json({message:'That username is already taken. Please choose another.'});
 }
-console.error(`Error updating credentials for ${admissionNo}:`,error);
 res.status(500).json({message:'Failed to update credentials.'});
 }
 });
@@ -530,7 +624,6 @@ const sql="INSERT INTO Holidays (HolidayDate, Description, HolidayType, AddedBy)
 db.query(sql,[date,description,holidayType,adminName],(err,result)=>{
 if(err){
 if(err.code==='ER_DUP_ENTRY')return res.status(409).json({message:`The date ${date} is already marked.`});
-console.error('❌ Error adding holiday:',err.message);
 return res.status(500).json({message:'Failed to add holiday.'});
 }
 res.status(201).json({message:'✅ Day marked successfully!'});
@@ -543,7 +636,6 @@ if(dayOfWeek===0){return res.status(200).json({isHoliday:true,description:'Weekl
 const sql="SELECT Description, HolidayType FROM Holidays WHERE HolidayDate = ?";
 db.query(sql,[date],(err,results)=>{
 if(err){
-console.error('❌ Error checking holiday status:',err.message);
 return res.status(500).json({message:'Database query failed.'});
 }
 if(results.length>0){res.status(200).json({isHoliday:true,description:results[0].Description,type:results[0].HolidayType});}
@@ -579,7 +671,6 @@ const logDetails=`Promoted ${result.affectedRows} students to Class: ${targetCla
 await logStudentActivity('BULK_PROMOTE','Admin',studentIds.join(', '),'Multiple Students',logDetails);
 res.status(200).json({message:`✅ Successfully promoted ${result.affectedRows} students.`});
 }catch(error){
-console.error('❌ Error during bulk promotion:',error);
 res.status(500).json({message:'Failed to promote students.',error:error.message});
 }
 });
@@ -595,7 +686,6 @@ const logDetails=`Deactivated ${result.affectedRows} students. Reason: ${reason|
 await logStudentActivity('BULK_DEACTIVATE','Admin',studentIds.join(', '),'Multiple Students',logDetails);
 res.status(200).json({message:`✅ Successfully deactivated ${result.affectedRows} students.`});
 }catch(error){
-console.error('❌ Error during bulk deactivation:',error);
 res.status(500).json({message:'Failed to deactivate students.',error:error.message});
 }
 });
@@ -611,7 +701,6 @@ const logDetails=`Bulk deactivated ${result.affectedRows} staff members. Reason:
 await db.promise().query('INSERT INTO ActivityLogs (ActionType, PerformedBy, TargetID, TargetName, Details) VALUES (?, ?, ?, ?, ?)',['BULK_DEACTIVATE','Admin',teacherIds.join(','),'Multiple Staff',logDetails]);
 res.status(200).json({message:`✅ Successfully deactivated ${result.affectedRows} staff members.`});
 }catch(error){
-console.error('❌ Error during bulk deactivation of teachers:',error);
 res.status(500).json({message:'Failed to deactivate staff.',error:error.message});
 }
 });
@@ -631,7 +720,6 @@ const year=dobDate.getFullYear();
 finalPassword=`${day}${month}${year}`;
 }
 }catch(e){
-console.warn('Could not parse DOB for default password:',s.dob,e);
 }
 }
 if(!s.admissionNo||!s.fullName||!finalUsername||finalUsername.trim()===''){
@@ -663,7 +751,6 @@ const newStudent={...s,id:result.insertId};
 await logStudentActivity('CREATE','Admin',s.admissionNo,s.fullName,'New student record created.');
 res.status(201).json({message:'✅ Student added successfully!',student:newStudent});
 }catch(err){
-console.error("Error adding student:",err.message);
 if(err.code==='ER_DUP_ENTRY'){
 if(err.message.includes('AdmissionNo')){
 return res.status(409).json({message:'Admission Number already exists.'});
@@ -676,6 +763,261 @@ return res.status(409).json({message:'A duplicate entry was detected.'});
 return res.status(500).json({message:'Add student failed',error:err.message});
 }
 });
+
+app.get('/api/pending-leaves', async (req, res) => {
+    try {
+        const sql = `
+            SELECT 
+                l.LeaveID as leaveId,
+                s.FullName as studentName,
+                CONCAT(s.CurrentClass, '-', s.Section) as className,
+                DATE_FORMAT(l.FromDate, '%Y-%m-%d') as fromDate,
+                DATE_FORMAT(l.ToDate, '%Y-%m-%d') as toDate,
+                l.Reason as reason
+            FROM Leaves l
+            JOIN Students s ON l.EntityID = s.AdmissionNo
+            WHERE l.EntityType = 'student' AND l.Status = 'Pending'
+            ORDER BY l.AppliedOn DESC;
+        `;
+        const [leaves] = await db.promise().query(sql);
+        res.status(200).json(leaves);
+    } catch (error) {
+        console.error('❌ Error fetching student pending leaves:', error.message);
+        res.status(500).json({ message: 'Failed to fetch pending leaves.' });
+    }
+});
+
+// Get all pending leave requests for TEACHERS
+app.get('/api/teacher-pending-leaves', async (req, res) => {
+    try {
+        const sql = `
+            SELECT 
+                l.LeaveID as leaveId,
+                t.FullName as studentName, -- Using 'studentName' for frontend consistency
+                t.Designation as className, -- Using 'Designation' for frontend consistency
+                DATE_FORMAT(l.FromDate, '%Y-%m-%d') as fromDate,
+                DATE_FORMAT(l.ToDate, '%Y-%m-%d') as toDate,
+                l.Reason as reason
+            FROM Leaves l
+            JOIN Teachers t ON l.EntityID = t.Id
+            WHERE l.EntityType = 'teacher' AND l.Status = 'Pending'
+            ORDER BY l.AppliedOn DESC;
+        `;
+        const [leaves] = await db.promise().query(sql);
+        res.status(200).json(leaves);
+    } catch (error) {
+        console.error('❌ Error fetching teacher pending leaves:', error.message);
+        res.status(500).json({ message: 'Failed to fetch pending leaves.' });
+    }
+});
+
+// Approve or Reject a STUDENT's leave request
+app.post('/api/approve-leave/:leaveId/:action', async (req, res) => {
+    const { leaveId, action } = req.params;
+    const adminName = "Admin"; // Or get from req.user if you have auth middleware
+
+    if (!['approve', 'reject'].includes(action)) {
+        return res.status(400).json({ message: 'Invalid action specified.' });
+    }
+
+    const connection = await db.promise().getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const newStatus = action === 'approve' ? 'Approved' : 'Rejected';
+
+        // 1. Update the leave status in the Leaves table
+        const [updateResult] = await connection.query(
+            'UPDATE Leaves SET Status = ? WHERE LeaveID = ?',
+            [newStatus, leaveId]
+        );
+
+        if (updateResult.affectedRows === 0) {
+            throw new Error('Leave request not found.');
+        }
+
+        // 2. If approved, update the main Attendance table for the date range
+        if (action === 'approve') {
+            const [[leaveDetails]] = await connection.query('SELECT EntityID, FromDate, ToDate FROM Leaves WHERE LeaveID = ?', [leaveId]);
+            
+            if (leaveDetails) {
+                const datesToMark = eachDayOfInterval({
+                    start: parseISO(leaveDetails.FromDate),
+                    end: parseISO(leaveDetails.ToDate)
+                });
+                
+                const attendanceRecords = datesToMark.map(date => [
+                    leaveDetails.EntityID,
+                    format(date, 'yyyy-MM-dd'),
+                    'OnLeave',
+                    adminName
+                ]);
+                
+                if (attendanceRecords.length > 0) {
+                    const attendanceSql = `
+                        INSERT INTO Attendance (StudentAdmissionNo, AttendanceDate, Status, MarkedByTeacher)
+                        VALUES ?
+                        ON DUPLICATE KEY UPDATE Status = VALUES(Status), MarkedByTeacher = VALUES(MarkedByTeacher)`;
+                    await connection.query(attendanceSql, [attendanceRecords]);
+                }
+            }
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: `Leave successfully ${newStatus.toLowerCase()}.` });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error(`❌ Error processing student leave ${action}:`, error.message);
+        res.status(500).json({ message: `Failed to ${action} leave.` });
+    } finally {
+        connection.release();
+    }
+});
+
+// Approve or Reject a TEACHER's leave request
+app.post('/api/teacher-approve-leave/:leaveId/:action', async (req, res) => {
+    const { leaveId, action } = req.params;
+    const adminName = "Admin";
+
+    if (!['approve', 'reject'].includes(action)) {
+        return res.status(400).json({ message: 'Invalid action specified.' });
+    }
+
+    const connection = await db.promise().getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const newStatus = action === 'approve' ? 'Approved' : 'Rejected';
+
+        const [updateResult] = await connection.query(
+            'UPDATE Leaves SET Status = ? WHERE LeaveID = ?',
+            [newStatus, leaveId]
+        );
+
+        if (updateResult.affectedRows === 0) {
+            throw new Error('Leave request not found.');
+        }
+        
+        if (action === 'approve') {
+            const [[leaveDetails]] = await connection.query('SELECT EntityID, FromDate, ToDate FROM Leaves WHERE LeaveID = ?', [leaveId]);
+            
+            if (leaveDetails) {
+                const datesToMark = eachDayOfInterval({
+                    start: parseISO(leaveDetails.FromDate),
+                    end: parseISO(leaveDetails.ToDate)
+                });
+                
+                const attendanceRecords = datesToMark.map(date => [
+                    leaveDetails.EntityID,
+                    format(date, 'yyyy-MM-dd'),
+                    'OnLeave',
+                    adminName,
+                    'Approved Leave'
+                ]);
+
+                if (attendanceRecords.length > 0) {
+                    const attendanceSql = `
+                        INSERT INTO TeacherAttendance (TeacherID, AttendanceDate, Status, MarkedBy, Note)
+                        VALUES ?
+                        ON DUPLICATE KEY UPDATE Status = VALUES(Status), MarkedBy = VALUES(MarkedBy), Note = VALUES(Note)`;
+                    await connection.query(attendanceSql, [attendanceRecords]);
+                }
+            }
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: `Leave successfully ${newStatus.toLowerCase()}.` });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error(`❌ Error processing teacher leave ${action}:`, error.message);
+        res.status(500).json({ message: `Failed to ${action} leave.` });
+    } finally {
+        connection.release();
+    }
+});
+
+app.post('/api/export-attendance', async (req, res) => {
+    try {
+        const {type, startDate, endDate, scopes, statuses} = req.body;
+        if (!type || !startDate || !endDate) {
+            return res.status(400).json({message: 'Type, Start Date, and End Date are required.'});
+        }
+        let queryParams = [startDate, endDate];
+        let baseQuery, whereClauses = ["a.AttendanceDate BETWEEN ? AND ?"];
+        let headers, orderByClause;
+
+        if (type === 'student') {
+            baseQuery = `
+              SELECT 
+                  DATE_FORMAT(a.AttendanceDate, '%d-%m-%Y') as Date,
+                  s.AdmissionNo as 'Admission No',
+                  s.FullName as 'Student Name',
+                  s.CurrentClass as 'Class',
+                  s.Section,
+                  a.Status,
+                  a.Note,
+                  a.MarkedByTeacher as 'Marked By'
+              FROM Attendance a
+              JOIN Students s ON a.StudentAdmissionNo = s.AdmissionNo
+          `;
+            headers = ['Date', 'Admission No', 'Student Name', 'Class', 'Section', 'Status', 'Note', 'Marked By'];
+            orderByClause = "ORDER BY a.AttendanceDate, s.CurrentClass, s.Section, s.FullName";
+            if (scopes && scopes.length > 0) {
+                whereClauses.push(`CONCAT(s.CurrentClass, '-', s.Section) IN (?)`);
+                queryParams.push(scopes);
+            }
+        } else if (type === 'teacher') {
+            baseQuery = `
+              SELECT 
+                  DATE_FORMAT(a.AttendanceDate, '%d-%m-%Y') as Date,
+                  t.Id as 'Teacher ID',
+                  t.FullName as 'Teacher Name',
+                  a.Status,
+                  a.Note,
+                  a.MarkedBy as 'Marked By'
+              FROM TeacherAttendance a
+              JOIN Teachers t ON a.TeacherID = t.Id
+          `;
+            headers = ['Date', 'Teacher ID', 'Teacher Name', 'Status', 'Note', 'Marked By'];
+            orderByClause = "ORDER BY a.AttendanceDate, t.FullName";
+        } else {
+            return res.status(400).json({message: 'Invalid entity type specified.'});
+        }
+
+        if (statuses && statuses.length > 0) {
+            whereClauses.push(`a.Status IN (?)`);
+            queryParams.push(statuses);
+        }
+
+        const finalQuery = `${baseQuery} WHERE ${whereClauses.join(' AND ')} ${orderByClause};`;
+        const [results] = await db.promise().query(finalQuery, queryParams);
+        
+        // The rest of the export logic remains the same...
+        if (results.length === 0) {
+            return res.status(404).json({message:'No records found for the selected criteria.'});
+        }
+        const worksheet = XLSX.utils.json_to_sheet(results, { header: headers });
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Attendance Report');
+        const columnWidths = headers.map(header => ({
+            wch: Math.max(header.length, ...results.map(row => row[header] ? row[header].toString().length: 0)) + 2
+        }));
+        worksheet['!cols'] = columnWidths;
+        const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+        const fileName = `${type}_attendance_${startDate}_to_${endDate}.xlsx`;
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.send(buffer);
+
+    } catch (error) {
+        console.error('❌ Export error:', error.message);
+        res.status(500).json({message: 'Failed to generate the report.'});
+    }
+});
+
+
 app.get('/api/get-students',(req,res)=>{
 const sql=`
     SELECT *, 
@@ -775,7 +1117,6 @@ const logDetails=changes.length>0?changes.join('; '):'Student record updated.';
 await logStudentActivity('UPDATE','Admin',admissionNo,updatedFields.fullName||oldStudent.FullName,logDetails);
 res.status(200).json({message:"✅ Student updated successfully!",student:updatedStudentRows[0]});
 }catch(error){
-console.error("❌ Error updating student:",error);
 if(error.message.includes('Username cannot be empty')){
 return res.status(400).json({message:error.message});
 }
@@ -828,7 +1169,6 @@ totalPages:Math.ceil(totalItems/limit),
 currentPage:page
 });
 }catch(error){
-console.error('❌ Error fetching student activity logs:',error.message);
 res.status(500).json({message:'Failed to fetch student activity logs'});
 }
 });
@@ -840,24 +1180,7 @@ if(result.affectedRows===0)return res.status(404).json({message:'Student not fou
 res.status(200).json({message:'✅ Student deleted'});
 });
 });
-app.post('/api/teacher-attendance',(req,res)=>{
-const {records,teacherName}=req.body;
-if(!Array.isArray(records)||records.length===0){
-return res.status(400).json({message:'No attendance records provided.'});
-}
-const sql=`
-    INSERT INTO TeacherAttendance (TeacherID, AttendanceDate, Status, MarkedBy, Note)
-    VALUES ?
-    ON DUPLICATE KEY UPDATE Status = VALUES(Status), MarkedBy = VALUES(MarkedBy), Note = VALUES(Note)`;
-const values=records.map(rec=>[rec.teacherId,rec.date,rec.status,teacherName||'Admin',rec.note||null]);
-db.query(sql,[values],(err,result)=>{
-if(err){
-console.error('❌ Error saving teacher attendance:',err.message);
-return res.status(500).json({message:'Failed to save teacher attendance',error:err.message});
-}
-res.status(201).json({message:'✅ Teacher attendance saved successfully',affectedRows:result.affectedRows});
-});
-});
+
 app.get('/api/teacher-attendance-report',(req,res)=>{
 const sql=`
     SELECT a.Id, a.AttendanceDate, a.Status, a.MarkedBy, a.Note, t.Id AS TeacherID, t.FullName
@@ -866,7 +1189,6 @@ const sql=`
     ORDER BY a.AttendanceDate DESC, t.FullName;`;
 db.query(sql,(err,results)=>{
 if(err){
-console.error('❌ Error fetching teacher attendance report:',err.message);
 return res.status(500).json({message:'Failed to fetch report',error:err.message});
 }
 res.status(200).json(results);
@@ -877,7 +1199,6 @@ const {date}=req.params;
 const sql="SELECT TeacherID, Status, Note FROM TeacherAttendance WHERE AttendanceDate = ?";
 db.query(sql,[date],(err,results)=>{
 if(err){
-console.error(`❌ Error fetching teacher attendance for ${date}:`,err.message);
 return res.status(500).json({message:'Database query failed'});
 }
 const attendanceMap=results.reduce((acc,record)=>{
@@ -953,9 +1274,53 @@ res.setHeader('Content-Disposition',`attachment; filename="${fileName}"`);
 res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
 res.send(buffer);
 }catch(error){
-console.error('❌ Error generating attendance export:',error.message);
 res.status(500).json({message:'Failed to generate the report.'});
 }
+});
+app.get('/api/todays-absentees', async (req, res) => {
+    try {
+        const today = new Date().toISOString().split('T')[0];
+        const getAbsenteesSQL = `
+            SELECT s.AdmissionNo, s.FullName, s.FathersName, s.Phone, s.CurrentClass, s.Section
+            FROM Students s
+            JOIN Attendance a ON s.AdmissionNo = a.StudentAdmissionNo
+            WHERE a.AttendanceDate = ? AND a.Status = 'Absent' AND s.IsActive = 1
+            ORDER BY s.CurrentClass, s.Section, s.FullName;
+        `;
+        const [absentees] = await db.promise().query(getAbsenteesSQL, [today]);
+        if (absentees.length === 0) {
+            return res.status(200).json([]);
+        }
+        const absenteeAdmissionNos = absentees.map(s => s.AdmissionNo);
+        const getHistorySQL = `
+            SELECT StudentAdmissionNo, AttendanceDate, Status
+            FROM Attendance
+            WHERE StudentAdmissionNo IN (?) AND AttendanceDate <= ?
+            ORDER BY StudentAdmissionNo, AttendanceDate DESC;
+        `;
+        const [history] = await db.promise().query(getHistorySQL, [absenteeAdmissionNos, today]);
+        const historyMap = history.reduce((acc, record) => {
+            if (!acc[record.StudentAdmissionNo]) acc[record.StudentAdmissionNo] = [];
+            acc[record.StudentAdmissionNo].push(record);
+            return acc;
+        }, {});
+        const results = absentees.map(student => {
+            let consecutiveDays = 0;
+            const studentHistory = historyMap[student.AdmissionNo] || [];
+            for (const record of studentHistory) {
+                if (record.Status === 'Absent') {
+                    consecutiveDays++;
+                } else {
+                    break;
+                }
+            }
+            return { ...student, ConsecutiveAbsentDays: consecutiveDays };
+        });
+        res.status(200).json(results);
+    } catch (error) {
+        console.error('❌ Error fetching today\'s absentees:', error.message);
+        res.status(500).json({ message: 'Failed to fetch today\'s absentees.' });
+    }
 });
 app.use((req,res)=>{res.status(404).json({message:`❌ Route not found: ${req.method} ${req.originalUrl}`});});
 app.use((err,req,res,next)=>{console.error("💥 GLOBAL ERROR HANDLER:",err.stack);res.status(500).json({message:"❌ An unexpected server error occurred."});});
